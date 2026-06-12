@@ -1,0 +1,1523 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentProps } from "react";
+import {
+  Ban,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  CircleAlert,
+  CircleOff,
+  Copy,
+  Download,
+  LoaderCircle,
+  Pencil,
+  Power,
+  PowerOff,
+  RefreshCw,
+  Search,
+  ServerCog,
+  Trash2,
+  UserRound,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import { PageHeader } from "@/components/page-header";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import {
+  deleteAccounts,
+  fetchAccountTokens,
+  fetchAccounts,
+  refreshAccounts,
+  runUpstreamAccountActions,
+  toggleAccountsEnabled,
+  updateAccount,
+  type Account,
+  type AccountStatus,
+  type AccountType,
+  type UpstreamAccountActionOptions,
+} from "@/lib/api";
+import { useAuthGuard } from "@/lib/use-auth-guard";
+import { cn } from "@/lib/utils";
+import { hasAPIPermission, type StoredAuthSession } from "@/store/auth";
+
+import { AccountImportDialog } from "./components/account-import-dialog";
+
+const QUOTA_REFRESH_EVENT = "chatgpt2api:quota-refresh";
+
+const accountTypeOptions: { label: string; value: AccountType | "all" }[] = [
+  { label: "全部类型", value: "all" },
+  { label: "Free", value: "Free" },
+  { label: "Plus", value: "Plus" },
+  { label: "ProLite", value: "ProLite" },
+  { label: "Team", value: "Team" },
+  { label: "Pro", value: "Pro" },
+];
+
+const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
+  { label: "全部状态", value: "all" },
+  { label: "正常", value: "正常" },
+  { label: "限流", value: "限流" },
+  { label: "异常", value: "异常" },
+  { label: "刷新中", value: "刷新中" },
+  { label: "过期待刷新", value: "过期待刷新" },
+  { label: "禁用", value: "禁用" },
+];
+
+const editableAccountStatusOptions = accountStatusOptions.filter(
+  (option): option is { label: string; value: AccountStatus } => option.value !== "all" && option.value !== "禁用",
+);
+
+const statusMeta: Record<
+  AccountStatus,
+  {
+    icon: typeof CheckCircle2;
+    badge: ComponentProps<typeof Badge>["variant"];
+  }
+> = {
+  正常: { icon: CheckCircle2, badge: "success" },
+  限流: { icon: CircleAlert, badge: "warning" },
+  异常: { icon: CircleOff, badge: "danger" },
+  刷新中: { icon: LoaderCircle, badge: "warning" },
+  过期待刷新: { icon: CircleAlert, badge: "warning" },
+  禁用: { icon: Ban, badge: "secondary" },
+};
+
+const metricCards = [
+  {
+    key: "total",
+    label: "账户总数",
+    description: "池内全部账号",
+    icon: UserRound,
+    iconClassName: "bg-stone-100 text-stone-600",
+  },
+  {
+    key: "active",
+    label: "正常",
+    description: "可用于调度",
+    icon: CheckCircle2,
+    iconClassName: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100",
+  },
+  {
+    key: "limited",
+    label: "限流",
+    description: "等待额度恢复",
+    icon: CircleAlert,
+    iconClassName: "bg-amber-50 text-amber-700 ring-1 ring-amber-100",
+  },
+  {
+    key: "abnormal",
+    label: "异常",
+    description: "建议刷新或移除",
+    icon: CircleOff,
+    iconClassName: "bg-rose-50 text-rose-700 ring-1 ring-rose-100",
+  },
+  {
+    key: "disabled",
+    label: "禁用",
+    description: "不会参与调度",
+    icon: Ban,
+    iconClassName: "bg-stone-100 text-stone-500",
+  },
+  {
+    key: "quota",
+    label: "可用额度",
+    description: "正常账号合计",
+    icon: RefreshCw,
+    iconClassName: "bg-[#edf4ff] text-[#1456f0] ring-1 ring-blue-100",
+  },
+] as const;
+
+function isUnlimitedImageQuotaAccount(account: Account) {
+  return account.type === "Pro" || account.type === "ProLite";
+}
+
+function formatCompact(value: number) {
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  return String(value);
+}
+
+function formatQuota(account: Account) {
+  if (isUnlimitedImageQuotaAccount(account)) {
+    return "∞";
+  }
+  if (account.imageQuotaUnknown) {
+    return "未知";
+  }
+  return String(Math.max(0, account.quota));
+}
+
+function formatRestoreAt(value?: string | null) {
+  if (!value) {
+    return { absolute: "—", relative: "" };
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return { absolute: value, relative: "" };
+  }
+
+  const diffMs = Math.max(0, date.getTime() - Date.now());
+  const totalHours = Math.ceil(diffMs / (1000 * 60 * 60));
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  const relative = diffMs > 0 ? `剩余 ${days}d ${hours}h` : "已到恢复时间";
+
+  const pad = (num: number) => String(num).padStart(2, "0");
+  const absolute = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+
+  return { absolute, relative };
+}
+
+function formatQuotaSummary(accounts: Account[]) {
+  const availableAccounts = accounts.filter((account) => account.enabled !== false && account.status === "正常");
+  if (availableAccounts.some(isUnlimitedImageQuotaAccount)) {
+    return "∞";
+  }
+  if (availableAccounts.some((account) => account.imageQuotaUnknown)) {
+    return "未知";
+  }
+  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+}
+
+function maskToken(token?: string) {
+  if (!token) return "—";
+  if (token.length <= 18) return token;
+  return `${token.slice(0, 16)}...${token.slice(-8)}`;
+}
+
+function accountTokenLabel(account: Account) {
+  return maskToken(account.access_token || account.token_preview || account.id);
+}
+
+function accountPrimaryLabel(account: Account) {
+  return account.email?.trim() || account.user_id?.trim() || "未识别账号";
+}
+
+function accountSecondaryLabel(account: Account) {
+  return accountTokenLabel(account);
+}
+
+function downloadTokenFile(tokens: string[]) {
+  const content = `${tokens.join("\n")}\n`;
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `accounts-${Date.now()}.txt`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function copyToClipboard(text: string, successMessage: string) {
+  if (!text) {
+    return;
+  }
+  void navigator.clipboard.writeText(text).then(
+    () => toast.success(successMessage),
+    () => toast.error("复制失败"),
+  );
+}
+
+function normalizeAccounts(items: Account[] | null | undefined): Account[] {
+  const accountItems = Array.isArray(items) ? items : [];
+  return accountItems.map((item) => ({
+    ...item,
+    type:
+      item.type === "Plus" ||
+      item.type === "ProLite" ||
+      item.type === "Team" ||
+      item.type === "Pro" ||
+      item.type === "Free"
+        ? item.type
+        : "Free",
+    enabled: typeof item.enabled === "boolean" ? item.enabled : item.status !== "禁用",
+  }));
+}
+
+function AccountsPageContent({ session }: { session: StoredAuthSession }) {
+  const didLoadRef = useRef(false);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [query, setQuery] = useState("");
+  const [typeFilter, setTypeFilter] = useState<AccountType | "all">("all");
+  const [statusFilter, setStatusFilter] = useState<AccountStatus | "all">("all");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState("10");
+  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
+  const [editType, setEditType] = useState<AccountType>("Free");
+  const [editStatus, setEditStatus] = useState<AccountStatus>("正常");
+  const [editQuota, setEditQuota] = useState("0");
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isRunningUpstreamActions, setIsRunningUpstreamActions] = useState(false);
+  const [isTogglingEnabled, setIsTogglingEnabled] = useState(false);
+  const [refreshingAccountIds, setRefreshingAccountIds] = useState<string[]>([]);
+  const [togglingAccountIds, setTogglingAccountIds] = useState<string[]>([]);
+  const [refreshAllDialogOpen, setRefreshAllDialogOpen] = useState(false);
+  const [upstreamActionDialogOpen, setUpstreamActionDialogOpen] = useState(false);
+  const [upstreamActionTargetIds, setUpstreamActionTargetIds] = useState<string[]>([]);
+  const [upstreamActionDisableMemory, setUpstreamActionDisableMemory] = useState(true);
+  const [upstreamActionHideConversations, setUpstreamActionHideConversations] = useState(true);
+  const [upstreamActionDeleteFiles, setUpstreamActionDeleteFiles] = useState(false);
+  const [upstreamActionFilePageLimit, setUpstreamActionFilePageLimit] = useState("100");
+
+  const canImportTokenAccounts = hasAPIPermission(session, "POST", "/api/accounts");
+  const canImportSessionAccounts = hasAPIPermission(session, "POST", "/api/accounts/session");
+  const canImportAccounts = canImportTokenAccounts || canImportSessionAccounts;
+  const canRefreshAccounts = hasAPIPermission(session, "POST", "/api/accounts/refresh");
+  const canRunUpstreamActions = hasAPIPermission(session, "POST", "/api/accounts/upstream-actions");
+  const canToggleAccountEnabled = hasAPIPermission(session, "POST", "/api/accounts/toggle-enabled");
+  const canUpdateAccount = hasAPIPermission(session, "POST", "/api/accounts/update");
+  const canDeleteAccounts = hasAPIPermission(session, "DELETE", "/api/accounts");
+  const canExportTokens = hasAPIPermission(session, "GET", "/api/accounts/tokens");
+
+  const applyAccountItems = useCallback((items: Account[] | null | undefined) => {
+    const nextAccounts = normalizeAccounts(items);
+    setAccounts(nextAccounts);
+    setSelectedIds((prev) => prev.filter((id) => nextAccounts.some((item) => item.id === id)));
+    return nextAccounts;
+  }, []);
+
+  const loadAccounts = useCallback(async (silent = false) => {
+    if (!silent) {
+      setIsLoading(true);
+    }
+    try {
+      const data = await fetchAccounts();
+      applyAccountItems(data.items);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "加载账户失败";
+      toast.error(message);
+    } finally {
+      if (!silent) {
+        setIsLoading(false);
+      }
+    }
+  }, [applyAccountItems]);
+
+  useEffect(() => {
+    if (didLoadRef.current) {
+      return;
+    }
+    didLoadRef.current = true;
+    void loadAccounts();
+  }, [loadAccounts]);
+
+  const filteredAccounts = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return accounts.filter((account) => {
+      const searchMatched =
+        normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
+      const typeMatched = typeFilter === "all" || account.type === typeFilter;
+      const statusMatched = statusFilter === "all" || account.status === statusFilter;
+      return searchMatched && typeMatched && statusMatched;
+    });
+  }, [accounts, query, statusFilter, typeFilter]);
+
+  const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / Number(pageSize)));
+  const safePage = Math.min(page, pageCount);
+  const startIndex = (safePage - 1) * Number(pageSize);
+  const currentRows = filteredAccounts.slice(startIndex, startIndex + Number(pageSize));
+  const allCurrentSelected =
+    currentRows.length > 0 && currentRows.every((row) => selectedIds.includes(row.id));
+  const showInitialEmptyState = !isLoading && accounts.length === 0;
+  const showFilteredEmptyState = !isLoading && accounts.length > 0 && currentRows.length === 0;
+
+  const summary = useMemo(() => {
+    const total = accounts.length;
+    const active = accounts.filter((item) => item.enabled !== false && item.status === "正常").length;
+    const limited = accounts.filter((item) => item.status === "限流").length;
+    const abnormal = accounts.filter((item) => item.status === "异常").length;
+    const disabled = accounts.filter((item) => item.enabled === false).length;
+    const quota = formatQuotaSummary(accounts);
+
+    return { total, active, limited, abnormal, disabled, quota };
+  }, [accounts]);
+
+  const selectedAccountIds = useMemo(() => {
+    const selectedSet = new Set(selectedIds);
+    return accounts.filter((item) => selectedSet.has(item.id)).map((item) => item.id);
+  }, [accounts, selectedIds]);
+
+  const abnormalAccountIds = useMemo(() => {
+    return accounts.filter((item) => item.status === "异常").map((item) => item.id);
+  }, [accounts]);
+
+  const refreshingAccountIdSet = useMemo(() => new Set(refreshingAccountIds), [refreshingAccountIds]);
+  const togglingAccountIdSet = useMemo(() => new Set(togglingAccountIds), [togglingAccountIds]);
+  const upstreamActionFilePageLimitValue = useMemo(() => {
+    const value = Number.parseInt(upstreamActionFilePageLimit, 10);
+    return Number.isFinite(value) && value > 0 ? value : 100;
+  }, [upstreamActionFilePageLimit]);
+
+  const paginationItems = useMemo(() => {
+    const items: (number | "...")[] = [];
+    const start = Math.max(1, safePage - 1);
+    const end = Math.min(pageCount, safePage + 1);
+
+    if (start > 1) items.push(1);
+    if (start > 2) items.push("...");
+    for (let current = start; current <= end; current += 1) items.push(current);
+    if (end < pageCount - 1) items.push("...");
+    if (end < pageCount) items.push(pageCount);
+
+    return items;
+  }, [pageCount, safePage]);
+
+  const handleDeleteAccounts = async (accountIds: string[]) => {
+    if (!canDeleteAccounts) {
+      toast.error("没有删除账号权限");
+      return;
+    }
+    if (accountIds.length === 0) {
+      toast.error("请先选择要删除的账户");
+      return;
+    }
+
+    setIsDeleting(true);
+    try {
+      const data = await deleteAccounts(accountIds);
+      applyAccountItems(data.items);
+      toast.success(`删除 ${data.removed ?? 0} 个账户`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "删除账户失败";
+      toast.error(message);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const handleRefreshAccounts = async (accountIds: string[]) => {
+    if (!canRefreshAccounts) {
+      toast.error("没有刷新账号权限");
+      return;
+    }
+    const targetIds = Array.from(new Set(accountIds.map((id) => id.trim()).filter(Boolean)));
+    if (targetIds.length === 0) {
+      toast.error("没有需要刷新的账户");
+      return;
+    }
+
+    setIsRefreshing(true);
+    setRefreshingAccountIds(targetIds);
+    try {
+      const data = await refreshAccounts(targetIds);
+      applyAccountItems(data.items);
+      window.dispatchEvent(new Event(QUOTA_REFRESH_EVENT));
+      if (data.errors.length > 0) {
+        const firstError = data.errors[0]?.error;
+        toast.error(
+          `刷新成功 ${data.refreshed} 个，失败 ${data.errors.length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
+        );
+      } else {
+        toast.success(`刷新成功 ${data.refreshed} 个账户`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "刷新账户失败";
+      toast.error(message);
+    } finally {
+      setIsRefreshing(false);
+      setRefreshingAccountIds([]);
+    }
+  };
+
+  const handleToggleAccountsEnabled = async (accountIds: string[], enabled: boolean) => {
+    if (!canToggleAccountEnabled) {
+      toast.error("没有启停账号权限");
+      return;
+    }
+    const targetIds = Array.from(new Set(accountIds.map((id) => id.trim()).filter(Boolean)));
+    if (targetIds.length === 0) {
+      toast.error("请先选择账号");
+      return;
+    }
+
+    setIsTogglingEnabled(true);
+    setTogglingAccountIds(targetIds);
+    try {
+      const data = await toggleAccountsEnabled(targetIds, enabled);
+      applyAccountItems(data.items);
+      toast.success(`${enabled ? "启用" : "禁用"} ${data.updated ?? 0} 个账号`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : `${enabled ? "启用" : "禁用"}账号失败`;
+      toast.error(message);
+    } finally {
+      setIsTogglingEnabled(false);
+      setTogglingAccountIds([]);
+    }
+  };
+
+  const handleExportTokens = async () => {
+    if (!canExportTokens) {
+      toast.error("没有导出 Token 权限");
+      return;
+    }
+    setIsExporting(true);
+    try {
+      const data = await fetchAccountTokens();
+      const tokens = (Array.isArray(data.tokens) ? data.tokens : [])
+        .map((item) => String(item || "").trim())
+        .filter(Boolean);
+      if (tokens.length === 0) {
+        toast.error("暂无可导出的 Token");
+        return;
+      }
+      downloadTokenFile(tokens);
+      toast.success(`已导出 ${tokens.length} 个 Token`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "导出 Token 失败";
+      toast.error(message);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const openUpstreamActionDialog = (accountIds: string[]) => {
+    if (!canRunUpstreamActions) {
+      toast.error("没有上游维护权限");
+      return;
+    }
+    const targetIds = Array.from(new Set(accountIds.map((id) => id.trim()).filter(Boolean)));
+    if (targetIds.length === 0) {
+      toast.error("请先选择要执行的账户");
+      return;
+    }
+    setUpstreamActionTargetIds(targetIds);
+    setUpstreamActionDisableMemory(true);
+    setUpstreamActionHideConversations(true);
+    setUpstreamActionDeleteFiles(false);
+    setUpstreamActionDialogOpen(true);
+  };
+
+  const executeUpstreamActions = async (accountIds: string[], options: UpstreamAccountActionOptions) => {
+    if (!canRunUpstreamActions) {
+      toast.error("没有上游维护权限");
+      return null;
+    }
+    const targetIds = Array.from(new Set(accountIds.map((id) => id.trim()).filter(Boolean)));
+    if (targetIds.length === 0) {
+      toast.error("请先选择要执行的账户");
+      return null;
+    }
+    if (!options.disable_memory && !options.hide_conversations && !options.delete_files) {
+      toast.error("请至少选择一项上游操作");
+      return null;
+    }
+
+    setIsRunningUpstreamActions(true);
+    try {
+      const data = await runUpstreamAccountActions(targetIds, {
+        disable_memory: options.disable_memory,
+        hide_conversations: options.hide_conversations,
+        delete_files: options.delete_files,
+        file_page_limit: options.file_page_limit,
+      });
+      const firstError = data.errors?.[0]?.error;
+      if (data.failed > 0) {
+        toast.error(
+          `上游维护部分失败，成功 ${data.succeeded} 个，失败 ${data.failed} 个${firstError ? `，首个错误：${firstError}` : ""}`,
+        );
+      } else {
+        toast.success(`上游维护完成，成功 ${data.succeeded} 个账户`);
+      }
+      return data;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "执行上游维护失败";
+      toast.error(message);
+      return null;
+    } finally {
+      setIsRunningUpstreamActions(false);
+    }
+  };
+
+  const handleBatchUpstreamActions = async () => {
+    const result = await executeUpstreamActions(upstreamActionTargetIds, {
+      disable_memory: upstreamActionDisableMemory,
+      hide_conversations: upstreamActionHideConversations,
+      delete_files: upstreamActionDeleteFiles,
+      file_page_limit: Number(upstreamActionFilePageLimit || 100),
+    });
+    if (result) {
+      setUpstreamActionDialogOpen(false);
+      setUpstreamActionTargetIds([]);
+    }
+  };
+
+  const handleSingleUpstreamAction = async (options: UpstreamAccountActionOptions) => {
+    if (!editingAccount) {
+      return;
+    }
+    await executeUpstreamActions([editingAccount.id], options);
+  };
+
+  const openEditDialog = (account: Account) => {
+    if (!canUpdateAccount) {
+      return;
+    }
+    setEditingAccount(account);
+    setEditType(account.type);
+    setEditStatus(account.status === "禁用" ? "正常" : account.status);
+    setEditQuota(String(account.quota));
+  };
+
+  const handleUpdateAccount = async () => {
+    if (!editingAccount || !canUpdateAccount) {
+      return;
+    }
+
+    setIsUpdating(true);
+    try {
+      const data = await updateAccount(editingAccount.id, {
+        type: editType,
+        status: editStatus,
+        quota: Number(editQuota || 0),
+      });
+      applyAccountItems(data.items);
+      setEditingAccount(null);
+      toast.success("账号信息已更新");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "更新账号失败";
+      toast.error(message);
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  const toggleSelectAll = (checked: boolean) => {
+    if (checked) {
+      setSelectedIds((prev) => Array.from(new Set([...prev, ...currentRows.map((item) => item.id)])));
+      return;
+    }
+    setSelectedIds((prev) => prev.filter((id) => !currentRows.some((row) => row.id === id)));
+  };
+
+  const toggleAccountSelection = (accountId: string, checked: boolean) => {
+    setSelectedIds((prev) =>
+      checked ? Array.from(new Set([...prev, accountId])) : prev.filter((item) => item !== accountId),
+    );
+  };
+
+  const renderStatusBadge = (account: Account) => {
+    const status = statusMeta[account.status];
+    const StatusIcon = status.icon;
+    return (
+      <>
+        <Badge variant={status.badge} className="inline-flex items-center gap-1 rounded-md px-2 py-1">
+          <StatusIcon className="size-3.5" />
+          {account.status}
+        </Badge>
+        {account.enabled === false ? (
+          <Badge variant="secondary" className="inline-flex items-center gap-1 rounded-md px-2 py-1">
+            <Ban className="size-3.5" />
+            已禁用
+          </Badge>
+        ) : null}
+      </>
+    );
+  };
+
+  const renderRestoreInfo = (account: Account) => {
+    const restore = formatRestoreAt(account.restoreAt);
+    return (
+      <div className="flex flex-col gap-0.5 text-xs leading-5 text-muted-foreground">
+        {restore.relative ? <span className="font-medium text-foreground">{restore.relative}</span> : null}
+        <span>{restore.absolute}</span>
+      </div>
+    );
+  };
+
+  const renderTokenLabel = (account: Account) => {
+    const secondaryLabel = accountSecondaryLabel(account);
+    if (!secondaryLabel) {
+      return null;
+    }
+
+    return (
+      <div className="flex min-w-0 items-center gap-1.5">
+        <code className="truncate rounded-md bg-stone-100 px-2 py-1 font-mono text-[11px] font-medium text-muted-foreground">
+          {secondaryLabel}
+        </code>
+        {canExportTokens && account.access_token ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-7 rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+            onClick={() => copyToClipboard(account.access_token || "", "token 已复制")}
+            aria-label="复制 Token"
+            title="复制 Token"
+          >
+            <Copy className="size-3.5" />
+          </Button>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderAccountActions = (account: Account, className?: string) => {
+    const rowRefreshing = refreshingAccountIdSet.has(account.id);
+    const rowTogglingEnabled = togglingAccountIdSet.has(account.id);
+    const nextEnabled = account.enabled === false;
+    return (
+      <div className={cn("flex items-center gap-1 text-muted-foreground", className)}>
+        {canToggleAccountEnabled ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 rounded-lg hover:bg-muted hover:text-foreground"
+            onClick={() => void handleToggleAccountsEnabled([account.id], nextEnabled)}
+            disabled={isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+            aria-label={nextEnabled ? "启用账号" : "禁用账号"}
+            title={nextEnabled ? "启用账号" : "禁用账号"}
+          >
+            {rowTogglingEnabled ? (
+              <LoaderCircle className="size-4 animate-spin" />
+            ) : nextEnabled ? (
+              <Power className="size-4" />
+            ) : (
+              <PowerOff className="size-4" />
+            )}
+          </Button>
+        ) : null}
+        {canUpdateAccount ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 rounded-lg hover:bg-muted hover:text-foreground"
+            onClick={() => openEditDialog(account)}
+            disabled={isUpdating || isRunningUpstreamActions || isTogglingEnabled}
+            aria-label="编辑账号"
+            title="编辑账号"
+          >
+            <Pencil className="size-4" />
+          </Button>
+        ) : null}
+        {canRefreshAccounts ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 rounded-lg hover:bg-muted hover:text-foreground"
+            onClick={() => void handleRefreshAccounts([account.id])}
+            disabled={isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+            aria-label="刷新账号信息和额度"
+            title="刷新账号信息和额度"
+          >
+            {rowRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+          </Button>
+        ) : null}
+        {canDeleteAccounts ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 rounded-lg text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+            onClick={() => void handleDeleteAccounts([account.id])}
+            disabled={isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+            aria-label="删除账号"
+            title="删除账号"
+          >
+            <Trash2 className="size-4" />
+          </Button>
+        ) : null}
+      </div>
+    );
+  };
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Account Pool"
+        title="号池管理"
+        actions={
+          <>
+            <Button
+              variant="outline"
+              className="h-10 rounded-lg"
+              onClick={() => void loadAccounts()}
+              disabled={isLoading || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+            >
+              <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
+              刷新
+            </Button>
+            {canRefreshAccounts ? (
+              <Button
+                variant="outline"
+                className="h-10 rounded-lg"
+                onClick={() => setRefreshAllDialogOpen(true)}
+                disabled={isLoading || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled || accounts.length === 0}
+              >
+                <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
+                一键刷新额度
+              </Button>
+            ) : null}
+            {canImportAccounts ? (
+              <AccountImportDialog
+                disabled={isLoading || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+                canImportTokens={canImportTokenAccounts}
+                canImportSession={canImportSessionAccounts}
+                onImported={(items) => {
+                  applyAccountItems(items);
+                  setSelectedIds([]);
+                  setPage(1);
+                }}
+              />
+            ) : null}
+            {canExportTokens ? (
+              <Button
+                variant="outline"
+                className="h-10 rounded-lg"
+                onClick={() => void handleExportTokens()}
+                disabled={accounts.length === 0 || isExporting || isTogglingEnabled}
+              >
+                {isExporting ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
+                导出 Token
+              </Button>
+            ) : null}
+          </>
+        }
+      />
+
+      <Dialog open={refreshAllDialogOpen} onOpenChange={setRefreshAllDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>确认刷新全部账号额度？</DialogTitle>
+            <DialogDescription>
+              将刷新全部 {accounts.length} 个账号的额度状态，可能需要一些时间。请确认不是误触后再继续。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setRefreshAllDialogOpen(false)}>
+              取消
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                setRefreshAllDialogOpen(false);
+                void handleRefreshAccounts(accounts.map((item) => item.id));
+              }}
+              disabled={
+                isLoading ||
+                isRefreshing ||
+                isDeleting ||
+                isRunningUpstreamActions ||
+                isTogglingEnabled ||
+                accounts.length === 0
+              }
+            >
+              确认刷新
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(editingAccount)} onOpenChange={(open) => (!open ? setEditingAccount(null) : null)}>
+        <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+          <DialogHeader className="gap-2">
+            <DialogTitle>编辑账户</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              手动修改账号状态、类型和额度。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">状态</label>
+              <Select value={editStatus} onValueChange={(value) => setEditStatus(value as AccountStatus)}>
+                <SelectTrigger className="h-11 rounded-xl border-stone-200 bg-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {editableAccountStatusOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">类型</label>
+              <Select value={editType} onValueChange={(value) => setEditType(value as AccountType)}>
+                <SelectTrigger className="h-11 rounded-xl border-stone-200 bg-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {accountTypeOptions
+                    .filter((option) => option.value !== "all")
+                    .map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">额度</label>
+              <Input
+                value={editQuota}
+                onChange={(event) => setEditQuota(event.target.value)}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
+            {canRunUpstreamActions ? (
+              <div className="space-y-3 rounded-2xl border border-stone-200 bg-stone-50 p-4">
+                <div className="space-y-1">
+                  <div className="text-sm font-semibold text-stone-900">上游维护</div>
+                  <div className="text-xs leading-5 text-muted-foreground">
+                    对当前账号直接执行记忆关闭、历史对话隐藏或附件删除。
+                  </div>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="h-10 rounded-xl bg-white px-3 text-stone-700 hover:bg-stone-100"
+                    onClick={() =>
+                      void handleSingleUpstreamAction({
+                        disable_memory: true,
+                        hide_conversations: false,
+                        delete_files: false,
+                        file_page_limit: upstreamActionFilePageLimitValue,
+                      })
+                    }
+                    disabled={isUpdating || isRunningUpstreamActions || isTogglingEnabled}
+                  >
+                    {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <ServerCog className="size-4" />}
+                    关闭记忆
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="h-10 rounded-xl bg-white px-3 text-stone-700 hover:bg-stone-100"
+                    onClick={() =>
+                      void handleSingleUpstreamAction({
+                        disable_memory: false,
+                        hide_conversations: true,
+                        delete_files: false,
+                        file_page_limit: upstreamActionFilePageLimitValue,
+                      })
+                    }
+                    disabled={isUpdating || isRunningUpstreamActions || isTogglingEnabled}
+                  >
+                    {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <ServerCog className="size-4" />}
+                    隐藏历史对话
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-10 rounded-xl border-rose-200 bg-white px-3 text-rose-600 hover:border-rose-300 hover:bg-rose-50 hover:text-rose-600"
+                    onClick={() =>
+                      void handleSingleUpstreamAction({
+                        disable_memory: false,
+                        hide_conversations: false,
+                        delete_files: true,
+                        file_page_limit: upstreamActionFilePageLimitValue,
+                      })
+                    }
+                    disabled={isUpdating || isRunningUpstreamActions || isTogglingEnabled}
+                  >
+                    {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                    删除附件
+                  </Button>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-stone-700">删除附件时最多处理文件数</label>
+                  <Input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={upstreamActionFilePageLimit}
+                    onChange={(event) => setUpstreamActionFilePageLimit(event.target.value)}
+                    className="h-11 rounded-xl border-stone-200 bg-white"
+                    disabled={isRunningUpstreamActions}
+                  />
+                </div>
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter className="pt-2">
+            <Button
+              variant="secondary"
+              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              onClick={() => setEditingAccount(null)}
+              disabled={isUpdating || isRunningUpstreamActions || isTogglingEnabled}
+            >
+              取消
+            </Button>
+            <Button
+              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              onClick={() => void handleUpdateAccount()}
+              disabled={isUpdating || isRunningUpstreamActions || !canUpdateAccount}
+            >
+              {isUpdating ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              保存修改
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={upstreamActionDialogOpen}
+        onOpenChange={(open) => {
+          setUpstreamActionDialogOpen(open);
+          if (!open) {
+            setUpstreamActionTargetIds([]);
+          }
+        }}
+      >
+        <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+          <DialogHeader className="gap-2">
+            <DialogTitle>上游维护</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              对选中的 {upstreamActionTargetIds.length} 个账号批量执行维护动作。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <label className="flex items-start gap-3 rounded-2xl border border-stone-200 bg-stone-50 p-4">
+              <Checkbox
+                checked={upstreamActionDisableMemory}
+                onCheckedChange={(checked) => setUpstreamActionDisableMemory(Boolean(checked))}
+                className="mt-0.5"
+              />
+              <div className="space-y-1">
+                <div className="text-sm font-medium text-stone-900">关闭记忆</div>
+                <div className="text-xs leading-5 text-muted-foreground">同时关闭 sunshine 和 moonshine 两个特性开关。</div>
+              </div>
+            </label>
+            <label className="flex items-start gap-3 rounded-2xl border border-stone-200 bg-stone-50 p-4">
+              <Checkbox
+                checked={upstreamActionHideConversations}
+                onCheckedChange={(checked) => setUpstreamActionHideConversations(Boolean(checked))}
+                className="mt-0.5"
+              />
+              <div className="space-y-1">
+                <div className="text-sm font-medium text-stone-900">隐藏历史对话</div>
+                <div className="text-xs leading-5 text-muted-foreground">通过 is_visible=false 隐藏对话记录，不做物理删除。</div>
+              </div>
+            </label>
+            <div className="space-y-3 rounded-2xl border border-stone-200 bg-stone-50 p-4">
+              <label className="flex items-start gap-3">
+                <Checkbox
+                  checked={upstreamActionDeleteFiles}
+                  onCheckedChange={(checked) => setUpstreamActionDeleteFiles(Boolean(checked))}
+                  className="mt-0.5"
+                />
+                <div className="space-y-1">
+                  <div className="text-sm font-medium text-stone-900">删除附件</div>
+                  <div className="text-xs leading-5 text-muted-foreground">
+                    先分页拉取文件库，再按 file_id 逐个删除。
+                  </div>
+                </div>
+              </label>
+              <div className="space-y-2 pl-7">
+                <label className="text-sm font-medium text-stone-700">每个账号最多处理文件数</label>
+                <Input
+                  type="number"
+                  min="1"
+                  max="100"
+                  value={upstreamActionFilePageLimit}
+                  onChange={(event) => setUpstreamActionFilePageLimit(event.target.value)}
+                  className="h-11 rounded-xl border-stone-200 bg-white"
+                  disabled={!upstreamActionDeleteFiles || isRunningUpstreamActions}
+                />
+              </div>
+            </div>
+          </div>
+          <DialogFooter className="pt-2">
+            <Button
+              variant="secondary"
+              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              onClick={() => setUpstreamActionDialogOpen(false)}
+              disabled={isRunningUpstreamActions}
+            >
+              取消
+            </Button>
+            <Button
+              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              onClick={() => void handleBatchUpstreamActions()}
+              disabled={
+                isRunningUpstreamActions ||
+                upstreamActionTargetIds.length === 0 ||
+                !canRunUpstreamActions ||
+                (!upstreamActionDisableMemory && !upstreamActionHideConversations && !upstreamActionDeleteFiles)
+              }
+            >
+              {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <ServerCog className="size-4" />}
+              开始执行
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <section className="mt-5 flex flex-col gap-3">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
+          {metricCards.map((item) => {
+            const Icon = item.icon;
+            const value = summary[item.key];
+            return (
+              <Card key={item.key} className="overflow-hidden rounded-[18px] bg-white/92 shadow-[0_8px_24px_rgba(24,40,72,0.06)]">
+                <CardContent className="flex items-center gap-3 p-4">
+                  <div className={cn("flex size-10 shrink-0 items-center justify-center rounded-[12px]", item.iconClassName)}>
+                    <Icon className="size-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium text-muted-foreground">{item.label}</div>
+                    <div className="mt-1 flex items-baseline gap-2">
+                      <span className="font-display text-2xl leading-none font-semibold text-foreground">
+                        {typeof value === "number" ? formatCompact(value) : value}
+                      </span>
+                    </div>
+                    <div className="mt-1 truncate text-xs text-muted-foreground">{item.description}</div>
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="mt-6 flex flex-col gap-4">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-semibold tracking-tight">账户列表</h2>
+            <Badge variant="secondary" className="rounded-lg bg-stone-200 px-2 py-0.5 text-stone-700">
+              {filteredAccounts.length}
+            </Badge>
+          </div>
+
+          <div className="grid gap-2 sm:grid-cols-[minmax(16rem,1fr)_10rem_10rem] lg:min-w-[38rem]">
+            <div className="relative min-w-0">
+              <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
+              <Input
+                value={query}
+                onChange={(event) => {
+                  setQuery(event.target.value);
+                  setPage(1);
+                }}
+                placeholder="搜索邮箱"
+                className="h-10 rounded-lg pl-10"
+              />
+            </div>
+            <Select
+              value={typeFilter}
+              onValueChange={(value) => {
+                setTypeFilter(value as AccountType | "all");
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="h-10 w-full rounded-lg">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {accountTypeOptions.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={statusFilter}
+              onValueChange={(value) => {
+                setStatusFilter(value as AccountStatus | "all");
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="h-10 w-full rounded-lg">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {accountStatusOptions.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        {isLoading && accounts.length === 0 ? (
+          <Card>
+            <CardContent className="flex flex-col items-center justify-center gap-3 px-6 py-14 text-center">
+              <div className="rounded-xl bg-stone-100 p-3 text-stone-500">
+                <LoaderCircle className="size-5 animate-spin" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-stone-700">正在加载账户</p>
+                <p className="text-sm text-stone-500">从后端同步账号列表和状态。</p>
+              </div>
+            </CardContent>
+          </Card>
+        ) : null}
+
+        <Card
+          className={cn(
+            "overflow-hidden",
+            isLoading && accounts.length === 0 ? "hidden" : "",
+          )}
+        >
+          <CardContent className="p-0">
+            <div className="flex flex-col gap-3 border-b border-stone-100 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                <div className="flex items-center gap-2 rounded-lg bg-stone-100 px-2.5 py-1 text-xs font-medium text-stone-600">
+                  <Checkbox
+                    checked={allCurrentSelected}
+                    onCheckedChange={(checked) => toggleSelectAll(Boolean(checked))}
+                    aria-label="选择当前页账号"
+                  />
+                  当前页全选
+                </div>
+                {canRefreshAccounts ? (
+                  <Button
+                    variant="ghost"
+                    className="h-8 rounded-lg px-3 text-stone-600 hover:bg-stone-100"
+                    onClick={() => void handleRefreshAccounts(selectedAccountIds)}
+                    disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+                  >
+                    {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                    刷新选中
+                  </Button>
+                ) : null}
+                {canToggleAccountEnabled ? (
+                  <Popover>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        className="h-8 rounded-lg px-3 text-stone-600 hover:bg-stone-100"
+                        disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+                      >
+                        {isTogglingEnabled ? <LoaderCircle className="size-4 animate-spin" /> : <Power className="size-4" />}
+                        批量启停
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" className="w-36 rounded-xl p-1">
+                      <Button
+                        variant="ghost"
+                        className="h-9 w-full justify-start rounded-lg px-3 text-stone-700"
+                        onClick={() => void handleToggleAccountsEnabled(selectedAccountIds, true)}
+                        disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+                      >
+                        <Power className="size-4" />
+                        批量启用
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        className="h-9 w-full justify-start rounded-lg px-3 text-stone-700"
+                        onClick={() => void handleToggleAccountsEnabled(selectedAccountIds, false)}
+                        disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+                      >
+                        <PowerOff className="size-4" />
+                        批量禁用
+                      </Button>
+                    </PopoverContent>
+                  </Popover>
+                ) : null}
+                {canRunUpstreamActions ? (
+                  <Button
+                    variant="ghost"
+                    className="h-8 rounded-lg px-3 text-[#1456f0] hover:bg-[#edf4ff] hover:text-[#1456f0]"
+                    onClick={() => openUpstreamActionDialog(selectedAccountIds)}
+                    disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+                  >
+                    {isRunningUpstreamActions ? <LoaderCircle className="size-4 animate-spin" /> : <ServerCog className="size-4" />}
+                    上游维护
+                  </Button>
+                ) : null}
+                {canDeleteAccounts ? (
+                  <>
+                    <Button
+                      variant="ghost"
+                      className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+                      onClick={() => void handleDeleteAccounts(abnormalAccountIds)}
+                      disabled={abnormalAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+                    >
+                      {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                      移除异常账号
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+                      onClick={() => void handleDeleteAccounts(selectedAccountIds)}
+                      disabled={selectedAccountIds.length === 0 || isRefreshing || isDeleting || isRunningUpstreamActions || isTogglingEnabled}
+                    >
+                      {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                      删除所选
+                    </Button>
+                  </>
+                ) : null}
+                {selectedIds.length > 0 ? (
+                  <span className="rounded-lg bg-[#edf4ff] px-2.5 py-1 text-xs font-medium text-[#1456f0]">
+                    已选择 {selectedIds.length} 项
+                  </span>
+                ) : null}
+              </div>
+            </div>
+
+            {showInitialEmptyState ? (
+              <div className="flex min-h-[260px] flex-col items-center justify-center gap-3 px-6 py-14 text-center">
+                <div className="rounded-[16px] bg-[#edf4ff] p-4 text-[#1456f0] ring-1 ring-blue-100">
+                  <UserRound className="size-7" />
+                </div>
+                <div className="space-y-1">
+                  <p className="text-sm font-medium text-foreground">暂无账号</p>
+                  <p className="max-w-[28rem] text-sm leading-6 text-muted-foreground">
+                    导入 Token 后，账号状态、类型、额度和调用统计会在这里显示。
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="hidden overflow-x-auto md:block">
+                  <Table className="min-w-[940px]">
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="w-12">
+                          <Checkbox
+                            checked={allCurrentSelected}
+                            onCheckedChange={(checked) => toggleSelectAll(Boolean(checked))}
+                            aria-label="选择当前页账号"
+                          />
+                        </TableHead>
+                        <TableHead className="w-[34%]">账号</TableHead>
+                        <TableHead className="w-48">状态 / 类型</TableHead>
+                        <TableHead className="w-32">额度</TableHead>
+                        <TableHead className="w-44">恢复时间</TableHead>
+                        <TableHead className="w-36">调用</TableHead>
+                        <TableHead className="w-28 text-right">操作</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {currentRows.map((account) => (
+                        <TableRow key={account.id} className="text-sm text-muted-foreground">
+                          <TableCell>
+                            <Checkbox
+                              checked={selectedIds.includes(account.id)}
+                              onCheckedChange={(checked) => toggleAccountSelection(account.id, Boolean(checked))}
+                              aria-label="选择账号"
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex min-w-0 flex-col gap-1.5">
+                              <span className="truncate font-medium tracking-tight text-foreground">
+                                {accountPrimaryLabel(account)}
+                              </span>
+                              {renderTokenLabel(account)}
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {renderStatusBadge(account)}
+                              <Badge variant="secondary" className="rounded-md px-2 py-1">
+                                {account.type}
+                              </Badge>
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="info" className="rounded-md px-2 py-1">
+                              {formatQuota(account)}
+                            </Badge>
+                          </TableCell>
+                          <TableCell>{renderRestoreInfo(account)}</TableCell>
+                          <TableCell>
+                            <div className="flex flex-col gap-1 text-xs leading-5">
+                              <span className="text-emerald-700">成功 {account.success}</span>
+                              <span className="text-rose-600">失败 {account.fail}</span>
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            {renderAccountActions(account, "justify-end")}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+
+                {currentRows.length > 0 ? (
+                  <div className="flex flex-col gap-3 p-3 md:hidden">
+                    {currentRows.map((account) => (
+                      <div key={account.id} className="rounded-[14px] border border-stone-100 bg-white p-3 shadow-[0_4px_14px_rgba(24,40,72,0.05)]">
+                        <div className="flex items-start gap-3">
+                          <Checkbox
+                            checked={selectedIds.includes(account.id)}
+                            onCheckedChange={(checked) => toggleAccountSelection(account.id, Boolean(checked))}
+                            className="mt-1"
+                            aria-label="选择账号"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex min-w-0 items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-semibold text-foreground">
+                                  {accountPrimaryLabel(account)}
+                                </div>
+                                <div className="mt-1">{renderTokenLabel(account)}</div>
+                              </div>
+                              {renderAccountActions(account, "shrink-0")}
+                            </div>
+
+                            <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                              {renderStatusBadge(account)}
+                              <Badge variant="secondary" className="rounded-md px-2 py-1">
+                                {account.type}
+                              </Badge>
+                              <Badge variant="info" className="rounded-md px-2 py-1">
+                                额度 {formatQuota(account)}
+                              </Badge>
+                            </div>
+
+                            <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                              <div className="rounded-lg bg-stone-50 p-2">
+                                <div className="text-muted-foreground">调用</div>
+                                <div className="mt-1 font-medium text-foreground">
+                                  成功 {account.success} / 失败 {account.fail}
+                                </div>
+                              </div>
+                              <div className="rounded-lg bg-stone-50 p-2">
+                                <div className="text-muted-foreground">恢复</div>
+                                <div className="mt-1">{renderRestoreInfo(account)}</div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {showFilteredEmptyState ? (
+                  <div className="flex flex-col items-center justify-center gap-3 px-6 py-14 text-center">
+                    <div className="rounded-xl bg-stone-100 p-3 text-stone-500">
+                      <Search className="size-5" />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <p className="text-sm font-medium text-stone-700">没有匹配的账户</p>
+                      <p className="text-sm text-stone-500">调整筛选条件或搜索关键字后重试。</p>
+                    </div>
+                  </div>
+                ) : null}
+
+            <div className="border-t border-stone-100 px-4 py-4">
+              <div className="flex items-center justify-center gap-3 overflow-x-auto whitespace-nowrap">
+                <div className="shrink-0 text-sm text-stone-500">
+                显示第 {filteredAccounts.length === 0 ? 0 : startIndex + 1} -{" "}
+                {Math.min(startIndex + Number(pageSize), filteredAccounts.length)} 条，共{" "}
+                {filteredAccounts.length} 条
+                </div>
+
+                <span className="shrink-0 text-sm leading-none text-stone-500">
+                  {safePage} / {pageCount} 页
+                </span>
+                <Select
+                  value={pageSize}
+                  onValueChange={(value) => {
+                    setPageSize(value);
+                    setPage(1);
+                  }}
+                >
+                  <SelectTrigger className="h-10 w-[108px] shrink-0 rounded-lg border-stone-200 bg-white text-sm leading-none">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="10">10 / 页</SelectItem>
+                    <SelectItem value="20">20 / 页</SelectItem>
+                    <SelectItem value="50">50 / 页</SelectItem>
+                    <SelectItem value="100">100 / 页</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="size-10 shrink-0 rounded-lg border-stone-200 bg-white"
+                  disabled={safePage <= 1}
+                  onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+                >
+                  <ChevronLeft className="size-4" />
+                </Button>
+                {paginationItems.map((item, index) =>
+                  item === "..." ? (
+                    <span key={`ellipsis-${index}`} className="px-1 text-sm text-stone-400">
+                      ...
+                    </span>
+                  ) : (
+                    <Button
+                      key={item}
+                      variant={item === safePage ? "default" : "outline"}
+                      className={cn(
+                        "h-10 min-w-10 shrink-0 rounded-lg px-3",
+                        item === safePage
+                          ? "bg-stone-950 text-white hover:bg-stone-800"
+                          : "border-stone-200 bg-white text-stone-700",
+                      )}
+                      onClick={() => setPage(item)}
+                    >
+                      {item}
+                    </Button>
+                  ),
+                )}
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="size-10 shrink-0 rounded-lg border-stone-200 bg-white"
+                  disabled={safePage >= pageCount}
+                  onClick={() => setPage((prev) => Math.min(pageCount, prev + 1))}
+                >
+                  <ChevronRight className="size-4" />
+                </Button>
+              </div>
+            </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+      </section>
+    </>
+  );
+}
+
+export default function AccountsPage() {
+  const { isCheckingAuth, session } = useAuthGuard(undefined, "/accounts");
+
+  if (isCheckingAuth || !session) {
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <LoaderCircle className="size-5 animate-spin text-stone-400" />
+      </div>
+    );
+  }
+
+  return <AccountsPageContent session={session} />;
+}

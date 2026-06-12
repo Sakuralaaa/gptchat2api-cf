@@ -1,0 +1,25 @@
+package util
+
+import "testing"
+
+func TestSummarizeUpstreamConnectionError(t *testing.T) {
+	cases := []string{
+		`Get "https://chatgpt.com/": surf: HTTP/2 request failed: uTLS.HandshakeContext() error: EOF; HTTP/1.1 fallback failed: uTLS.HandshakeContext() error: EOF`,
+		"curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL",
+		"TLS connect error: connection reset by peer",
+		"error: OPENSSL_INTERNAL:WRONG_VERSION_NUMBER",
+	}
+	for _, input := range cases {
+		got, ok := SummarizeUpstreamConnectionError(input)
+		if !ok {
+			t.Fatalf("SummarizeUpstreamConnectionError(%q) did not match", input)
+		}
+		if got != UpstreamConnectionFailureMessage {
+			t.Fatalf("summary = %q, want %q", got, UpstreamConnectionFailureMessage)
+		}
+	}
+
+	if got, ok := SummarizeUpstreamConnectionError("upstream returned 500"); ok || got != "" {
+		t.Fatalf("non-connection summary = %q, %v", got, ok)
+	}
+}

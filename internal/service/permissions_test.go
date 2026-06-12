@@ -1,0 +1,67 @@
+package service
+
+import "testing"
+
+func TestNormalizeAPIPermissionsMigratesCreationTaskPermissions(t *testing.T) {
+	permissions := NormalizeAPIPermissions([]string{
+		APIPermissionKey("GET", "/api/image-tasks"),
+		"POST /api/image-tasks",
+	})
+
+	if !HasAPIPermission(PermissionSet{APIPermissions: permissions}, "GET", "/api/creation-tasks") {
+		t.Fatalf("migrated permissions missing creation task read: %#v", permissions)
+	}
+	if !HasAPIPermission(PermissionSet{APIPermissions: permissions}, "POST", "/api/creation-tasks/chat-completions") {
+		t.Fatalf("migrated permissions missing creation task submit subtree: %#v", permissions)
+	}
+	if HasAPIPermission(PermissionSet{APIPermissions: permissions}, "GET", "/api/image-tasks") {
+		t.Fatalf("old image task route should not be authorized: %#v", permissions)
+	}
+}
+
+func TestAPIPermissionsAccountPoolAreExplicit(t *testing.T) {
+	readOnly := PermissionSet{APIPermissions: []string{APIPermissionKey("GET", "/api/accounts")}}
+	if !HasAPIPermission(readOnly, "GET", "/api/accounts") {
+		t.Fatalf("read-only account permission missing account list")
+	}
+	if HasAPIPermission(readOnly, "GET", "/api/accounts/tokens") {
+		t.Fatalf("account list permission should not allow token export")
+	}
+	if HasAPIPermission(readOnly, "POST", "/api/accounts/refresh") {
+		t.Fatalf("account list permission should not allow refresh")
+	}
+	if HasAPIPermission(readOnly, "POST", "/api/accounts/upstream-actions") {
+		t.Fatalf("account list permission should not allow upstream actions")
+	}
+	if HasAPIPermission(readOnly, "POST", "/api/accounts/toggle-enabled") {
+		t.Fatalf("account list permission should not allow toggling enabled state")
+	}
+
+	operators := PermissionSet{APIPermissions: NormalizeAPIPermissions([]string{
+		APIPermissionKey("GET", "/api/accounts/tokens"),
+		APIPermissionKey("POST", "/api/accounts"),
+		APIPermissionKey("POST", "/api/accounts/session"),
+		APIPermissionKey("POST", "/api/accounts/refresh"),
+		APIPermissionKey("POST", "/api/accounts/upstream-actions"),
+		APIPermissionKey("POST", "/api/accounts/update"),
+		APIPermissionKey("POST", "/api/accounts/toggle-enabled"),
+		APIPermissionKey("DELETE", "/api/accounts"),
+	})}
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{"GET", "/api/accounts/tokens"},
+		{"POST", "/api/accounts"},
+		{"POST", "/api/accounts/session"},
+		{"POST", "/api/accounts/refresh"},
+		{"POST", "/api/accounts/upstream-actions"},
+		{"POST", "/api/accounts/update"},
+		{"POST", "/api/accounts/toggle-enabled"},
+		{"DELETE", "/api/accounts"},
+	} {
+		if !HasAPIPermission(operators, tc.method, tc.path) {
+			t.Fatalf("missing explicit permission for %s %s in %#v", tc.method, tc.path, operators.APIPermissions)
+		}
+	}
+}

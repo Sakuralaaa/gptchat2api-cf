@@ -1,0 +1,93 @@
+version: 2
+
+project_name: chatgpt2api
+
+builds:
+  - id: chatgpt2api
+    main: ./internal
+    binary: chatgpt2api
+    flags:
+      - -tags=embed
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X chatgpt2api/internal/version.Version={{ .Version }}
+      - -X chatgpt2api/internal/version.Commit={{ .Commit }}
+      - -X chatgpt2api/internal/version.Date={{ .Date }}
+      - -X chatgpt2api/internal/version.BuildType=release
+
+archives:
+  - id: default
+    formats: ["tar.gz"]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - .env.example
+      - deploy/docker-compose.yml
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+dockers_v2:
+  - id: dockerhub
+    disable: '{{ if eq .Env.DOCKERHUB_USERNAME "skip" }}true{{ else }}false{{ end }}'
+    dockerfile: deploy/Dockerfile.release
+    images:
+      - "{{ .Env.DOCKERHUB_USERNAME }}/chatgpt2api"
+    tags:
+      - "{{ .Version }}"
+      - "latest"
+      - "{{ .Major }}.{{ .Minor }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+
+  - id: ghcr
+    dockerfile: deploy/Dockerfile.release
+    images:
+      - "ghcr.io/{{ .Env.GITHUB_REPO_OWNER_LOWER }}/chatgpt2api"
+    tags:
+      - "{{ .Version }}"
+      - "latest"
+      - "{{ .Major }}.{{ .Minor }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "org.opencontainers.image.source": "https://github.com/{{ .Env.GITHUB_REPO_OWNER }}/{{ .Env.GITHUB_REPO_NAME }}"
+
+release:
+  draft: false
+  prerelease: auto
+  replace_existing_artifacts: true
+  name_template: "chatgpt2api {{ .Version }}"
+  header: |
+    {{ .Env.TAG_MESSAGE }}
+  footer: |
+
+    ---
+
+    ## Docker
+
+    ```bash
+    {{ if ne .Env.DOCKERHUB_USERNAME "skip" -}}
+    docker pull {{ .Env.DOCKERHUB_USERNAME }}/chatgpt2api:{{ .Version }}
+    {{ end -}}
+    docker pull ghcr.io/{{ .Env.GITHUB_REPO_OWNER_LOWER }}/chatgpt2api:{{ .Version }}
+    ```

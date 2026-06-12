@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.7
+#
+# Release-only runtime image. GoReleaser builds the chatgpt2api binary first,
+# then uses this Dockerfile to package that binary for DockerHub/GHCR.
+
+FROM debian:bookworm-slim
+
+ARG TARGETPLATFORM
+WORKDIR /app
+ENV PORT=80
+ENV CHATGPT2API_DEPLOYMENT=docker
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY $TARGETPLATFORM/chatgpt2api /app/chatgpt2api
+
+RUN mkdir -p /app/data && chmod +x /app/chatgpt2api
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:${PORT:-80}/health || exit 1
+
+CMD ["/app/chatgpt2api"]

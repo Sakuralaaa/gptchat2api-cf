@@ -1,0 +1,2079 @@
+package backend
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
+	"math"
+	"net/http"
+	urlpkg "net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"chatgpt2api/internal/util"
+
+	_ "github.com/HugoSmits86/nativewebp"
+)
+
+const (
+	officialPreparePath = "/backend-api/f/conversation/prepare"
+	officialStreamPath  = "/backend-api/f/conversation"
+
+	ResponsesImageMainModel      = "gpt-5.4-mini"
+	ResponsesImageCodexToolModel = "gpt-5.4-mini"
+
+	codexResponsesPath       = "/backend-api/codex/responses"
+	codexResponsesUserAgent  = "codex-tui/0.128.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.128.0)"
+	codexResponsesOriginator = "codex-tui"
+
+	responsesImageDefaultSize  = "1024x1024"
+	responsesImageSizeMultiple = 16
+	responsesImageMaxEdge      = 3840
+	responsesImageMaxRatio     = 3
+	responsesImageMinPixels    = 655360
+	responsesImageMaxPixels    = 8294400
+
+	officialImageDownloadAttempts = 3
+)
+
+var officialImageDownloadRetryDelay = 750 * time.Millisecond
+
+type ResponsesInputImage struct {
+	Data        []byte
+	ContentType string
+}
+
+type ResponsesImageRequest struct {
+	Prompt            string
+	Model             string
+	Size              string
+	Quality           string
+	Background        string
+	Moderation        string
+	Style             string
+	OutputFormat      string
+	OutputCompression *int
+	PartialImages     *int
+	InputImages       []ResponsesInputImage
+	InputImageMask    *ResponsesInputImage
+	ConversationID    string
+	ParentMessageID   string
+}
+
+type ResponsesImageEvent struct {
+	Type              string
+	ItemID            string
+	MessageID         string
+	Result            string
+	PartialImage      string
+	PartialImageIndex int
+	RevisedPrompt     string
+	OutputFormat      string
+	Background        string
+	Size              string
+	Quality           string
+	Model             string
+	Created           int64
+	ConversationID    string
+	FileIDs           []string
+	SedimentIDs       []string
+	Text              string
+	Blocked           bool
+	ToolInvoked       *bool
+	TurnUseCase       string
+	Raw               map[string]any
+	interpreterAssets []officialInterpreterAsset
+	pollTarget        officialImagePollTarget
+}
+
+type uploadedImageRef struct {
+	FileID      string
+	FileName    string
+	FileSize    int
+	MIMEType    string
+	Width       int
+	Height      int
+	IsMaskImage bool
+}
+
+type imageConversationState struct {
+	Text              string
+	ConversationID    string
+	MessageID         string
+	FileIDs           []string
+	SedimentIDs       []string
+	InterpreterAssets []officialInterpreterAsset
+	Blocked           bool
+	ToolInvoked       *bool
+	TurnUseCase       string
+	PollTarget        officialImagePollTarget
+}
+
+type officialImagePollTarget struct {
+	TurnExchangeID string
+	ImageGenTaskID string
+	MessageIDs     []string
+}
+
+func (t officialImagePollTarget) clone() officialImagePollTarget {
+	return officialImagePollTarget{
+		TurnExchangeID: t.TurnExchangeID,
+		ImageGenTaskID: t.ImageGenTaskID,
+		MessageIDs:     append([]string(nil), t.MessageIDs...),
+	}
+}
+
+func (t officialImagePollTarget) hasTarget() bool {
+	return strings.TrimSpace(t.TurnExchangeID) != "" || strings.TrimSpace(t.ImageGenTaskID) != "" || len(t.MessageIDs) > 0
+}
+
+type officialInterpreterAsset struct {
+	AssetID        string
+	MessageID      string
+	ConversationID string
+	FileName       string
+	MIMEType       string
+	Width          int
+	Height         int
+}
+
+func (c *Client) StreamResponsesImage(ctx context.Context, request ResponsesImageRequest) (<-chan ResponsesImageEvent, <-chan error) {
+	out := make(chan ResponsesImageEvent)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(out)
+		defer close(errCh)
+		if usesCodexResponsesImageRoute(request.Model) {
+			errCh <- c.streamCodexResponsesImage(ctx, request, out)
+			return
+		}
+		errCh <- c.streamOfficialResponsesImage(ctx, request, out)
+	}()
+	return out, errCh
+}
+
+func usesCodexResponsesImageRoute(model string) bool {
+	switch strings.TrimSpace(model) {
+	case util.ImageModelCodex, ResponsesImageCodexToolModel:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) streamOfficialResponsesImage(ctx context.Context, request ResponsesImageRequest, out chan<- ResponsesImageEvent) error {
+	if strings.TrimSpace(c.AccessToken) == "" {
+		return fmt.Errorf("access_token is required for official image conversation route")
+	}
+	prompt := strings.TrimSpace(request.Prompt)
+	if prompt == "" {
+		return fmt.Errorf("prompt is required")
+	}
+	if err := c.bootstrap(ctx); err != nil {
+		return err
+	}
+	reqs, err := c.getChatRequirements(ctx)
+	if err != nil {
+		return err
+	}
+	attachments := make([]uploadedImageRef, 0, len(request.InputImages))
+	for index, input := range request.InputImages {
+		ref, uploadErr := c.uploadImage(ctx, input, fmt.Sprintf("image_%d.%s", index+1, uploadImageExtension(normalizeUploadImageFormat(input.ContentType))))
+		if uploadErr != nil {
+			return uploadErr
+		}
+		attachments = append(attachments, ref)
+	}
+	var maskRef *uploadedImageRef
+	if request.InputImageMask != nil && len(request.InputImageMask.Data) > 0 {
+		ref, uploadErr := c.uploadImage(ctx, *request.InputImageMask, "mask."+uploadImageExtension(normalizeUploadImageFormat(request.InputImageMask.ContentType)))
+		if uploadErr != nil {
+			return uploadErr
+		}
+		ref.IsMaskImage = true
+		maskRef = &ref
+	}
+	streamPrompt := buildOfficialImagePrompt(prompt, request.Size)
+	conduitToken, err := c.prepareOfficialImageConversation(ctx, streamPrompt, reqs, request)
+	if err != nil {
+		return err
+	}
+	resp, err := c.startOfficialImageConversation(ctx, streamPrompt, reqs, conduitToken, request, attachments, maskRef)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return upstreamHTTPError(officialStreamPath, resp.StatusCode, data)
+	}
+	return iterOfficialImageSSE(ctx, c, resp.Body, request, out)
+}
+
+func (c *Client) streamCodexResponsesImage(ctx context.Context, request ResponsesImageRequest, out chan<- ResponsesImageEvent) error {
+	if strings.TrimSpace(c.AccessToken) == "" {
+		return fmt.Errorf("access_token is required for codex responses image route")
+	}
+	accountID := c.chatGPTAccountID()
+	headers, err := c.responsesImageHeaders(accountID)
+	if err != nil {
+		return err
+	}
+	payload, err := buildResponsesImagePayload(request)
+	if err != nil {
+		return err
+	}
+	resp, err := c.postRaw(ctx, codexResponsesPath, payload, headers, true)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return upstreamHTTPError(codexResponsesPath, resp.StatusCode, data)
+	}
+	return iterResponsesImageSSE(ctx, resp.Body, out)
+}
+
+func (c *Client) responsesImageHeaders(accountID string) (map[string]string, error) {
+	if strings.TrimSpace(c.AccessToken) == "" {
+		return nil, fmt.Errorf("access_token is required for codex responses image route")
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, fmt.Errorf("chatgpt_account_id is required for codex responses image route")
+	}
+	if c.sessionID == "" {
+		c.sessionID = util.NewUUID()
+	}
+	return map[string]string{
+		"Authorization":         "Bearer " + c.AccessToken,
+		"Chatgpt-Account-Id":    accountID,
+		"Content-Type":          "application/json",
+		"Accept":                "text/event-stream",
+		"User-Agent":            codexResponsesUserAgent,
+		"Originator":            codexResponsesOriginator,
+		"Session_id":            c.sessionID,
+		"Connection":            "Keep-Alive",
+		"X-OpenAI-Target-Path":  codexResponsesPath,
+		"X-OpenAI-Target-Route": codexResponsesPath,
+	}, nil
+}
+
+func buildResponsesImagePayload(request ResponsesImageRequest) ([]byte, error) {
+	prompt := strings.TrimSpace(request.Prompt)
+	if prompt == "" {
+		return nil, fmt.Errorf("prompt is required")
+	}
+	content := []any{map[string]any{"type": "input_text", "text": prompt}}
+	for _, image := range request.InputImages {
+		if len(image.Data) == 0 {
+			continue
+		}
+		content = append(content, map[string]any{"type": "input_image", "image_url": imageDataURL(image)})
+	}
+	tool := map[string]any{"type": "image_generation", "action": "generate"}
+	if len(request.InputImages) > 0 {
+		tool["action"] = "edit"
+	}
+	if model := normalizeResponsesImageToolModel(request.Model); model != "" {
+		tool["model"] = model
+	}
+	if size := normalizeResponsesImageToolSize(request.Size); size != "" {
+		tool["size"] = size
+	}
+	for key, value := range map[string]string{
+		"quality":       request.Quality,
+		"background":    request.Background,
+		"moderation":    request.Moderation,
+		"style":         request.Style,
+		"output_format": request.OutputFormat,
+	} {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			tool[key] = trimmed
+		}
+	}
+	if request.OutputCompression != nil && supportsResponsesImageOutputCompression(request.OutputFormat) {
+		tool["output_compression"] = *request.OutputCompression
+	}
+	if request.PartialImages != nil {
+		tool["partial_images"] = *request.PartialImages
+	}
+	if request.InputImageMask != nil && len(request.InputImageMask.Data) > 0 {
+		tool["input_image_mask"] = map[string]any{"image_url": imageDataURL(*request.InputImageMask)}
+	}
+	payload := map[string]any{
+		"model":               ResponsesImageMainModel,
+		"input":               []any{map[string]any{"role": "user", "content": content}},
+		"tools":               []any{tool},
+		"tool_choice":         map[string]any{"type": "image_generation"},
+		"instructions":        "You generate and edit images for the user.",
+		"stream":              true,
+		"store":               false,
+		"parallel_tool_calls": true,
+		"include":             []string{"reasoning.encrypted_content"},
+	}
+	return json.Marshal(payload)
+}
+
+func supportsResponsesImageOutputCompression(format string) bool {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "jpg", "jpeg":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeResponsesImageToolModel(model string) string {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "", util.ImageModelAuto, "gpt-image-1", util.ImageModelGPT:
+		return ""
+	case util.ImageModelCodex:
+		return ResponsesImageCodexToolModel
+	case ResponsesImageCodexToolModel:
+		return ResponsesImageCodexToolModel
+	case util.ImageModelGPT54:
+		return util.ImageModelGPT54
+	case util.ImageModelGPT55:
+		return util.ImageModelGPT55
+	case "gpt-5-5-thinking":
+		return "gpt-5-5-thinking"
+	default:
+		return ""
+	}
+}
+
+func normalizeResponsesImageToolSize(size string) string {
+	normalized := strings.ToLower(strings.TrimSpace(size))
+	normalized = strings.ReplaceAll(normalized, " ", "")
+	normalized = strings.ReplaceAll(normalized, "×", "x")
+	if normalized == "" || normalized == "auto" {
+		return ""
+	}
+	switch normalized {
+	case "1080p":
+		return normalizeResponsesImageDimensions(1080, 1080)
+	case "2k":
+		return normalizeResponsesImageDimensions(2048, 2048)
+	case "4k":
+		return normalizeResponsesImageDimensions(3840, 3840)
+	}
+	if width, height, ok := parseResponsesImageDimensions(normalized); ok {
+		if width < 128 && height < 128 {
+			return responsesImageSizeFromRatio(float64(width), float64(height))
+		}
+		return normalizeResponsesImageDimensions(width, height)
+	}
+	if ratioWidth, ratioHeight, ok := parseResponsesImageRatio(normalized); ok {
+		return responsesImageSizeFromRatio(ratioWidth, ratioHeight)
+	}
+	return ""
+}
+
+func parseResponsesImageDimensions(value string) (int, int, bool) {
+	match := regexp.MustCompile(`^(\d+)x(\d+)$`).FindStringSubmatch(value)
+	if len(match) != 3 {
+		return 0, 0, false
+	}
+	width, err := strconv.Atoi(match[1])
+	if err != nil || width <= 0 {
+		return 0, 0, false
+	}
+	height, err := strconv.Atoi(match[2])
+	if err != nil || height <= 0 {
+		return 0, 0, false
+	}
+	return width, height, true
+}
+
+func parseResponsesImageRatio(value string) (float64, float64, bool) {
+	match := regexp.MustCompile(`^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$`).FindStringSubmatch(value)
+	if len(match) != 3 {
+		return 0, 0, false
+	}
+	width, err := strconv.ParseFloat(match[1], 64)
+	if err != nil || width <= 0 {
+		return 0, 0, false
+	}
+	height, err := strconv.ParseFloat(match[2], 64)
+	if err != nil || height <= 0 {
+		return 0, 0, false
+	}
+	return width, height, true
+}
+
+func responsesImageSizeFromRatio(ratioWidth, ratioHeight float64) string {
+	if ratioWidth <= 0 || ratioHeight <= 0 {
+		return ""
+	}
+	if ratioWidth == ratioHeight {
+		return responsesImageDefaultSize
+	}
+	if ratioWidth > ratioHeight {
+		return normalizeResponsesImageDimensions(1536, int(float64(1536)*ratioHeight/ratioWidth+0.5))
+	}
+	return normalizeResponsesImageDimensions(int(float64(1536)*ratioWidth/ratioHeight+0.5), 1536)
+}
+
+func normalizeResponsesImageDimensions(width, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+	normalizedWidth := roundToResponsesImageMultiple(width)
+	normalizedHeight := roundToResponsesImageMultiple(height)
+
+	scaleToFit := func(scale float64) {
+		normalizedWidth = floorToResponsesImageMultiple(float64(normalizedWidth) * scale)
+		normalizedHeight = floorToResponsesImageMultiple(float64(normalizedHeight) * scale)
+	}
+	scaleToFill := func(scale float64) {
+		normalizedWidth = ceilToResponsesImageMultiple(float64(normalizedWidth) * scale)
+		normalizedHeight = ceilToResponsesImageMultiple(float64(normalizedHeight) * scale)
+	}
+
+	for range 4 {
+		maxEdge := max(normalizedWidth, normalizedHeight)
+		if maxEdge > responsesImageMaxEdge {
+			scaleToFit(float64(responsesImageMaxEdge) / float64(maxEdge))
+		}
+		if normalizedWidth > normalizedHeight*responsesImageMaxRatio {
+			normalizedWidth = floorToResponsesImageMultiple(float64(normalizedHeight * responsesImageMaxRatio))
+		} else if normalizedHeight > normalizedWidth*responsesImageMaxRatio {
+			normalizedHeight = floorToResponsesImageMultiple(float64(normalizedWidth * responsesImageMaxRatio))
+		}
+		pixels := normalizedWidth * normalizedHeight
+		if pixels > responsesImageMaxPixels {
+			scaleToFit(math.Sqrt(float64(responsesImageMaxPixels) / float64(pixels)))
+		} else if pixels < responsesImageMinPixels {
+			scaleToFill(math.Sqrt(float64(responsesImageMinPixels) / float64(pixels)))
+		}
+	}
+
+	return fmt.Sprintf("%dx%d", normalizedWidth, normalizedHeight)
+}
+
+func roundToResponsesImageMultiple(value int) int {
+	return max(responsesImageSizeMultiple, ((value+responsesImageSizeMultiple/2)/responsesImageSizeMultiple)*responsesImageSizeMultiple)
+}
+
+func floorToResponsesImageMultiple(value float64) int {
+	return max(responsesImageSizeMultiple, int(value/float64(responsesImageSizeMultiple))*responsesImageSizeMultiple)
+}
+
+func ceilToResponsesImageMultiple(value float64) int {
+	base := int(value / float64(responsesImageSizeMultiple))
+	if float64(base*responsesImageSizeMultiple) < value {
+		base++
+	}
+	return max(responsesImageSizeMultiple, base*responsesImageSizeMultiple)
+}
+
+func iterResponsesImageSSE(ctx context.Context, reader io.Reader, out chan<- ResponsesImageEvent) error {
+	payloads := make(chan string)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(payloads)
+		errCh <- iterSSEPayloads(ctx, reader, payloads)
+	}()
+	for payload := range payloads {
+		event, ok, err := parseResponsesImagePayload(payload)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		select {
+		case out <- event:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return <-errCh
+}
+
+func parseResponsesImagePayload(payload string) (ResponsesImageEvent, bool, error) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" || payload == "[DONE]" {
+		return ResponsesImageEvent{}, false, nil
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(payload), &data); err != nil {
+		return ResponsesImageEvent{}, false, err
+	}
+	eventType := util.Clean(data["type"])
+	event := ResponsesImageEvent{Type: eventType, Created: time.Now().Unix(), Raw: data}
+	switch eventType {
+	case "response.image_generation_call.partial_image":
+		event.PartialImage = util.Clean(data["partial_image_b64"])
+		event.PartialImageIndex = util.ToInt(data["partial_image_index"], 0)
+		event.OutputFormat = util.Clean(data["output_format"])
+		event.Background = util.Clean(data["background"])
+		return event, event.PartialImage != "", nil
+	case "response.output_item.done":
+		item := util.StringMap(data["item"])
+		if util.Clean(item["type"]) != "image_generation_call" {
+			return event, false, nil
+		}
+		mergeResponsesImageItem(&event, item)
+		return event, event.Result != "", nil
+	case "response.completed":
+		response := util.StringMap(data["response"])
+		for _, raw := range anySlice(response["output"]) {
+			item, ok := raw.(map[string]any)
+			if !ok || util.Clean(item["type"]) != "image_generation_call" {
+				continue
+			}
+			mergeResponsesImageItem(&event, item)
+			return event, event.Result != "", nil
+		}
+		return event, false, nil
+	case "error":
+		message := util.Clean(data["message"])
+		if message == "" {
+			message = util.Clean(util.StringMap(data["error"])["message"])
+		}
+		if message == "" {
+			message = "codex responses image route returned an error"
+		}
+		return event, false, fmt.Errorf("%s", message)
+	default:
+		return event, false, nil
+	}
+}
+
+func mergeResponsesImageItem(event *ResponsesImageEvent, item map[string]any) {
+	event.ItemID = util.Clean(item["id"])
+	event.Result = firstNonEmpty(util.Clean(item["result"]), util.Clean(item["b64_json"]))
+	event.RevisedPrompt = util.Clean(item["revised_prompt"])
+	event.OutputFormat = util.Clean(item["output_format"])
+	event.Background = util.Clean(item["background"])
+	event.Size = util.Clean(item["size"])
+	event.Quality = util.Clean(item["quality"])
+	event.Model = util.Clean(item["model"])
+}
+
+func anySlice(value any) []any {
+	if list, ok := value.([]any); ok {
+		return list
+	}
+	return nil
+}
+
+func imageDataURL(image ResponsesInputImage) string {
+	contentType := strings.TrimSpace(image.ContentType)
+	if contentType == "" {
+		contentType = "image/png"
+	}
+	return "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func buildOfficialImagePrompt(prompt, size string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return ""
+	}
+	var hints []string
+	if sizeHint := buildOfficialImageSizeHint(size); sizeHint != "" {
+		hints = append(hints, sizeHint)
+	}
+	if len(hints) == 0 {
+		return prompt
+	}
+	return prompt + "\n\n" + strings.Join(hints, "\n")
+}
+
+func buildOfficialImageSizeHint(size string) string {
+	size = strings.ToLower(strings.TrimSpace(size))
+	if size == "" || size == "auto" {
+		return ""
+	}
+	size = strings.ReplaceAll(size, "×", "x")
+	size = strings.ReplaceAll(size, " ", "")
+	hints := map[string]string{
+		"1:1":   "输出为 1:1 正方形构图，主体居中，适合正方形画幅。",
+		"3:2":   "输出为 3:2 横版构图，适合摄影、产品展示和横向叙事画幅。",
+		"2:3":   "输出为 2:3 竖版构图，适合海报、人物和纵向叙事画幅。",
+		"16:9":  "输出为 16:9 横屏构图，适合宽画幅展示。",
+		"9:16":  "输出为 9:16 竖屏构图，适合竖版画幅展示。",
+		"4:3":   "输出为 4:3 比例，兼顾宽度与高度，适合展示画面细节。",
+		"3:4":   "输出为 3:4 比例，纵向构图，适合人物肖像或竖向场景。",
+		"1080p": "以 1080 x 1080 像素对应的正方形画幅作为构图偏好，实际像素以上游返回为准。",
+		"2k":    "以 2048 x 2048 像素对应的正方形画幅作为构图偏好，实际像素以上游返回为准。",
+		"4k":    "以 2880 x 2880 像素对应的正方形画幅作为构图偏好，实际像素以上游返回为准。",
+	}
+	if hint, ok := hints[size]; ok {
+		return hint
+	}
+	if width, height, ok := parseOfficialImageDimensions(size); ok {
+		return fmt.Sprintf("以 %d x %d 像素对应的宽高比作为构图偏好，实际像素以上游返回为准。", width, height)
+	}
+	return "输出图片，目标尺寸或宽高比为 " + size + "。"
+}
+
+func normalizeUploadImageFormat(contentType string) string {
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	switch contentType {
+	case "image/jpeg", "image/jpg":
+		return "jpeg"
+	case "image/webp":
+		return "webp"
+	case "image/gif":
+		return "gif"
+	default:
+		return "png"
+	}
+}
+
+func uploadImageExtension(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "jpeg", "jpg":
+		return "jpg"
+	case "webp":
+		return "webp"
+	case "gif":
+		return "gif"
+	default:
+		return "png"
+	}
+}
+
+func parseOfficialImageDimensions(value string) (int, int, bool) {
+	match := regexp.MustCompile(`^(\d+)x(\d+)$`).FindStringSubmatch(value)
+	if len(match) != 3 {
+		return 0, 0, false
+	}
+	width, err := strconv.Atoi(match[1])
+	if err != nil || width <= 0 {
+		return 0, 0, false
+	}
+	height, err := strconv.Atoi(match[2])
+	if err != nil || height <= 0 {
+		return 0, 0, false
+	}
+	return width, height, true
+}
+
+func (c *Client) officialHeaders(path string, reqs ChatRequirements, conduitToken, accept string) map[string]string {
+	extra := map[string]string{
+		"Content-Type": "application/json",
+		"Accept":       accept,
+		"OpenAI-Sentinel-Chat-Requirements-Token": reqs.Token,
+	}
+	if reqs.ProofToken != "" {
+		extra["OpenAI-Sentinel-Proof-Token"] = reqs.ProofToken
+	}
+	if reqs.TurnstileToken != "" {
+		extra["OpenAI-Sentinel-Turnstile-Token"] = reqs.TurnstileToken
+	}
+	if reqs.SOToken != "" {
+		extra["OpenAI-Sentinel-SO-Token"] = reqs.SOToken
+	}
+	if strings.TrimSpace(conduitToken) != "" {
+		extra["X-Conduit-Token"] = conduitToken
+	}
+	if accept == "text/event-stream" {
+		extra["X-Oai-Turn-Trace-Id"] = util.NewUUID()
+	}
+	return c.headers(path, extra)
+}
+
+func (c *Client) prepareOfficialImageConversation(ctx context.Context, prompt string, reqs ChatRequirements, request ResponsesImageRequest) (string, error) {
+	parentMessageID := firstNonEmpty(strings.TrimSpace(request.ParentMessageID), util.NewUUID())
+	payload := map[string]any{
+		"action":                "next",
+		"fork_from_shared_post": false,
+		"parent_message_id":     parentMessageID,
+		"model":                 officialImageModelSlug(request.Model),
+		"client_prepare_state":  "success",
+		"timezone_offset_min":   -480,
+		"timezone":              "Asia/Shanghai",
+		"conversation_mode":     map[string]any{"kind": "primary_assistant"},
+		"system_hints":          []any{"picture_v2"},
+		"partial_query": map[string]any{
+			"id":      util.NewUUID(),
+			"author":  map[string]any{"role": "user"},
+			"content": map[string]any{"content_type": "text", "parts": []any{prompt}},
+		},
+		"supports_buffering":  true,
+		"supported_encodings": []any{"v1"},
+		"client_contextual_info": map[string]any{
+			"app_name": "chatgpt.com",
+		},
+	}
+	if conversationID := strings.TrimSpace(request.ConversationID); conversationID != "" {
+		payload["conversation_id"] = conversationID
+	}
+	resp, err := c.postJSON(ctx, officialPreparePath, payload, c.officialHeaders(officialPreparePath, reqs, "", "*/*"), false)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if err := ensureOK(resp, officialPreparePath); err != nil {
+		return "", err
+	}
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
+	}
+	return util.Clean(data["conduit_token"]), nil
+}
+
+func officialImageModelSlug(model string) string {
+	switch strings.TrimSpace(model) {
+	case util.ImageModelGPT:
+		return "gpt-5-5"
+	case util.ImageModelCodex:
+		return util.ImageModelCodex
+	case "", util.ImageModelAuto:
+		return "auto"
+	default:
+		return "auto"
+	}
+}
+
+func (c *Client) uploadImage(ctx context.Context, input ResponsesInputImage, fileName string) (uploadedImageRef, error) {
+	if len(input.Data) == 0 {
+		return uploadedImageRef{}, fmt.Errorf("image data is required")
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(input.Data))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return uploadedImageRef{}, fmt.Errorf("image decode failed: %w", err)
+	}
+	contentType := strings.TrimSpace(input.ContentType)
+	if contentType == "" {
+		contentType = "image/png"
+	}
+	path := "/backend-api/files"
+	payload := map[string]any{
+		"file_name": fileName,
+		"file_size": len(input.Data),
+		"use_case":  "multimodal",
+		"width":     cfg.Width,
+		"height":    cfg.Height,
+	}
+	resp, err := c.postJSON(ctx, path, payload, c.headers(path, map[string]string{"Content-Type": "application/json", "Accept": "application/json"}), false)
+	if err != nil {
+		return uploadedImageRef{}, err
+	}
+	defer resp.Body.Close()
+	if err := ensureOK(resp, path); err != nil {
+		return uploadedImageRef{}, err
+	}
+	var uploaded map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&uploaded); err != nil {
+		return uploadedImageRef{}, err
+	}
+	uploadURL := util.Clean(uploaded["upload_url"])
+	fileID := util.Clean(uploaded["file_id"])
+	if uploadURL == "" || fileID == "" {
+		return uploadedImageRef{}, fmt.Errorf("file upload metadata incomplete")
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(input.Data))
+	for key, value := range map[string]string{
+		"Content-Type":    contentType,
+		"x-ms-blob-type":  "BlockBlob",
+		"x-ms-version":    "2020-04-08",
+		"Origin":          c.BaseURL,
+		"Referer":         c.BaseURL + "/",
+		"User-Agent":      c.userAgent,
+		"Accept":          "application/json, text/plain, */*",
+		"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
+	} {
+		req.Header.Set(key, value)
+	}
+	uploadResp, err := c.httpClient.Do(req)
+	if err != nil {
+		return uploadedImageRef{}, upstreamTransportError("image_upload", err)
+	}
+	defer uploadResp.Body.Close()
+	if uploadResp.StatusCode < 200 || uploadResp.StatusCode >= 300 {
+		data, _ := io.ReadAll(uploadResp.Body)
+		return uploadedImageRef{}, upstreamHTTPError("image_upload", uploadResp.StatusCode, data)
+	}
+	time.Sleep(500 * time.Millisecond)
+	finalizePath := "/backend-api/files/" + fileID + "/uploaded"
+	finalizeReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+finalizePath, strings.NewReader("{}"))
+	for key, value := range c.headers(finalizePath, map[string]string{"Content-Type": "application/json", "Accept": "application/json"}) {
+		finalizeReq.Header.Set(key, value)
+	}
+	finalizeResp, err := c.httpClient.Do(finalizeReq)
+	if err != nil {
+		return uploadedImageRef{}, upstreamTransportError(finalizePath, err)
+	}
+	defer finalizeResp.Body.Close()
+	if err := ensureOK(finalizeResp, finalizePath); err != nil {
+		return uploadedImageRef{}, err
+	}
+	return uploadedImageRef{
+		FileID:   fileID,
+		FileName: fileName,
+		FileSize: len(input.Data),
+		MIMEType: contentType,
+		Width:    cfg.Width,
+		Height:   cfg.Height,
+	}, nil
+}
+
+func (c *Client) startOfficialImageConversation(ctx context.Context, prompt string, reqs ChatRequirements, conduitToken string, request ResponsesImageRequest, refs []uploadedImageRef, maskRef *uploadedImageRef) (*http.Response, error) {
+	parts := make([]any, 0, len(refs)+2)
+	for _, ref := range refs {
+		parts = append(parts, map[string]any{
+			"content_type":  "image_asset_pointer",
+			"asset_pointer": "file-service://" + ref.FileID,
+			"width":         ref.Width,
+			"height":        ref.Height,
+			"size_bytes":    ref.FileSize,
+		})
+	}
+	parts = append(parts, prompt)
+	content := map[string]any{"content_type": "text", "parts": []any{prompt}}
+	if len(refs) > 0 {
+		content = map[string]any{"content_type": "multimodal_text", "parts": parts}
+	}
+	metadata := map[string]any{
+		"developer_mode_connector_ids": []any{},
+		"selected_github_repos":        []any{},
+		"selected_all_github_repos":    false,
+		"system_hints":                 []any{"picture_v2"},
+		"serialization_metadata":       map[string]any{"custom_symbol_offsets": []any{}},
+	}
+	if len(refs) > 0 {
+		attachments := make([]map[string]any, 0, len(refs))
+		for _, ref := range refs {
+			attachments = append(attachments, map[string]any{
+				"id":       ref.FileID,
+				"mimeType": ref.MIMEType,
+				"name":     ref.FileName,
+				"size":     ref.FileSize,
+				"width":    ref.Width,
+				"height":   ref.Height,
+			})
+		}
+		metadata["attachments"] = attachments
+	}
+	if maskRef != nil {
+		metadata["mask_attachment"] = map[string]any{
+			"id":       maskRef.FileID,
+			"mimeType": maskRef.MIMEType,
+			"name":     maskRef.FileName,
+			"size":     maskRef.FileSize,
+			"width":    maskRef.Width,
+			"height":   maskRef.Height,
+		}
+		content["mask_pointer"] = "file-service://" + maskRef.FileID
+	}
+	userMessageID := util.NewUUID()
+	parentMessageID := firstNonEmpty(strings.TrimSpace(request.ParentMessageID), util.NewUUID())
+	payload := map[string]any{
+		"action": "next",
+		"messages": []any{
+			map[string]any{
+				"id":          userMessageID,
+				"author":      map[string]any{"role": "user"},
+				"create_time": float64(time.Now().UnixNano()) / 1e9,
+				"content":     content,
+				"metadata":    metadata,
+			},
+		},
+		"parent_message_id":                    parentMessageID,
+		"model":                                officialImageModelSlug(request.Model),
+		"client_prepare_state":                 "sent",
+		"timezone_offset_min":                  -480,
+		"timezone":                             "Asia/Shanghai",
+		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
+		"enable_message_followups":             true,
+		"system_hints":                         []any{"picture_v2"},
+		"supports_buffering":                   true,
+		"supported_encodings":                  []any{"v1"},
+		"paragen_cot_summary_display_override": "allow",
+		"force_parallel_switch":                "auto",
+		"client_contextual_info": map[string]any{
+			"is_dark_mode":      false,
+			"time_since_loaded": 1200,
+			"page_height":       1072,
+			"page_width":        1724,
+			"pixel_ratio":       1.2,
+			"screen_height":     1440,
+			"screen_width":      2560,
+			"app_name":          "chatgpt.com",
+		},
+	}
+	headers := c.officialHeaders(officialStreamPath, reqs, conduitToken, "text/event-stream")
+	if conversationID := strings.TrimSpace(request.ConversationID); conversationID != "" {
+		payload["conversation_id"] = conversationID
+		headers["OpenAI-Conversation-Id"] = conversationID
+	}
+	headers["OpenAI-Message-Id"] = userMessageID
+	return c.postJSON(ctx, officialStreamPath, payload, headers, true)
+}
+
+func iterOfficialImageSSE(ctx context.Context, client *Client, reader io.Reader, request ResponsesImageRequest, out chan<- ResponsesImageEvent) error {
+	state := &imageConversationState{}
+	payloads := make(chan string)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(payloads)
+		errCh <- iterSSEPayloads(ctx, reader, payloads)
+	}()
+
+	emittedResult := false
+	lastEvent := ResponsesImageEvent{}
+	for payload := range payloads {
+		event, ok, err := parseOfficialImagePayload(payload, state)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		lastEvent = event
+		select {
+		case out <- event:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if event.Result != "" {
+			emittedResult = true
+		}
+	}
+	if err := <-errCh; err != nil {
+		return err
+	}
+	if emittedResult {
+		return nil
+	}
+	if shouldTreatOfficialImageEventAsFinalText(lastEvent) {
+		return nil
+	}
+	if strings.TrimSpace(lastEvent.Text) != "" && !isPendingOfficialImageText(lastEvent.Text) && !shouldResolveOfficialImageResults(lastEvent) {
+		lastEvent.Type = "image_text_response"
+		select {
+		case out <- lastEvent:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return nil
+	}
+	if textEvent, ok, err := client.resolveOfficialImageTextResponse(ctx, lastEvent); err != nil {
+		return err
+	} else if ok {
+		select {
+		case out <- textEvent:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return nil
+	}
+	resolved, err := client.resolveOfficialImageResults(ctx, request, lastEvent)
+	if err != nil {
+		return err
+	}
+	for _, event := range resolved {
+		select {
+		case out <- event:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if len(resolved) == 0 && strings.TrimSpace(lastEvent.Text) != "" {
+		lastEvent.Type = "image_text_response"
+		select {
+		case out <- lastEvent:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return nil
+	}
+	return nil
+}
+
+func (c *Client) resolveOfficialImageTextResponse(ctx context.Context, event ResponsesImageEvent) (ResponsesImageEvent, bool, error) {
+	if !isOfficialImageTextResponseTurn(event) {
+		return ResponsesImageEvent{}, false, nil
+	}
+	text := strings.TrimSpace(event.Text)
+	if text == "" {
+		conversationID := strings.TrimSpace(event.ConversationID)
+		if conversationID != "" {
+			var err error
+			text, err = c.fetchOfficialConversationText(ctx, conversationID)
+			if err != nil {
+				return ResponsesImageEvent{}, false, err
+			}
+		}
+	}
+	if text == "" {
+		text = "Image generation returned a text response instead of image data."
+	}
+	event.Type = "image_text_response"
+	event.Text = text
+	return event, true, nil
+}
+
+func isOfficialImageTextResponseTurn(event ResponsesImageEvent) bool {
+	if event.Blocked {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(event.TurnUseCase), "text") {
+		return true
+	}
+	if shouldResolveOfficialImageResults(event) {
+		return false
+	}
+	return event.ToolInvoked != nil && !*event.ToolInvoked
+}
+
+func isPendingOfficialImageText(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return false
+	}
+	pendingPhrases := []string{
+		"正在处理图片",
+		"图片准备好后",
+		"creating your image",
+		"working on your image",
+		"image is ready",
+		"we'll notify you",
+		"we will notify you",
+	}
+	for _, phrase := range pendingPhrases {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldTreatOfficialImageEventAsFinalText(event ResponsesImageEvent) bool {
+	if strings.TrimSpace(event.Text) == "" || event.Result != "" {
+		return false
+	}
+	if event.Blocked {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(event.TurnUseCase), "text") {
+		return true
+	}
+	if shouldResolveOfficialImageResults(event) {
+		return false
+	}
+	if isOfficialImageGenerationUseCase(event.TurnUseCase) {
+		return false
+	}
+	return event.ToolInvoked != nil && !*event.ToolInvoked
+}
+
+func shouldResolveOfficialImageResults(event ResponsesImageEvent) bool {
+	if officialImageEventHasResultPointers(event) {
+		return true
+	}
+	if !isOfficialImageGenerationUseCase(event.TurnUseCase) {
+		return false
+	}
+	text := strings.TrimSpace(event.Text)
+	return text == "" || isPendingOfficialImageText(text)
+}
+
+func officialImageEventHasResultPointers(event ResponsesImageEvent) bool {
+	return len(event.interpreterAssets) > 0 || len(filterOfficialImageIDs(event.FileIDs)) > 0 || len(filterOfficialImageIDs(event.SedimentIDs)) > 0
+}
+
+func isOfficialImageGenerationUseCase(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.ReplaceAll(normalized, "_", " ")
+	normalized = strings.ReplaceAll(normalized, "-", " ")
+	normalized = strings.Join(strings.Fields(normalized), " ")
+	return normalized == "image gen" || normalized == "image generation"
+}
+
+func parseOfficialImagePayload(payload string, state *imageConversationState) (ResponsesImageEvent, bool, error) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" || payload == "[DONE]" {
+		return ResponsesImageEvent{}, false, nil
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(payload), &data); err != nil {
+		updateOfficialImageConversationState(state, payload, nil)
+		return ResponsesImageEvent{}, false, nil
+	}
+	updateOfficialImageConversationState(state, payload, data)
+	eventType := util.Clean(data["type"])
+	event := ResponsesImageEvent{
+		Type:              eventType,
+		Created:           time.Now().Unix(),
+		ConversationID:    state.ConversationID,
+		MessageID:         state.MessageID,
+		FileIDs:           append([]string(nil), state.FileIDs...),
+		SedimentIDs:       append([]string(nil), state.SedimentIDs...),
+		Text:              state.Text,
+		Blocked:           state.Blocked,
+		ToolInvoked:       state.ToolInvoked,
+		TurnUseCase:       state.TurnUseCase,
+		Raw:               data,
+		interpreterAssets: append([]officialInterpreterAsset(nil), state.InterpreterAssets...),
+		pollTarget:        state.PollTarget.clone(),
+	}
+	if message := officialImageTextMessage(data); message != "" && event.Result == "" {
+		event.Text = message
+	}
+	switch eventType {
+	case "moderation", "title_generation", "message_stream_complete", "server_ste_metadata", "message_marker", "input_message", "resume_conversation_token":
+		return event, true, nil
+	case "error":
+		message := util.Clean(data["message"])
+		if message == "" {
+			message = util.Clean(util.StringMap(data["error"])["message"])
+		}
+		if message == "" {
+			message = "official image conversation route returned an error"
+		}
+		return event, false, fmt.Errorf("%s", message)
+	default:
+		return event, true, nil
+	}
+}
+
+func updateOfficialImageConversationState(state *imageConversationState, payload string, event map[string]any) {
+	conversationID, fileIDs, sedimentIDs := extractOfficialConversationIDs(payload)
+	if conversationID != "" && state.ConversationID == "" {
+		state.ConversationID = conversationID
+	}
+	if event == nil {
+		return
+	}
+	if util.Clean(event["conversation_id"]) != "" {
+		state.ConversationID = util.Clean(event["conversation_id"])
+	}
+	value := util.StringMap(event["v"])
+	if util.Clean(value["conversation_id"]) != "" {
+		state.ConversationID = util.Clean(value["conversation_id"])
+	}
+	if messageID := assistantMessageIDFromOfficialImagePayload(event); messageID != "" {
+		state.MessageID = messageID
+	}
+	if assets := officialInterpreterAssetsFromEvent(event, state.ConversationID); len(assets) > 0 {
+		state.InterpreterAssets = assets
+	}
+	state.PollTarget = mergeOfficialImagePollTarget(state.PollTarget, officialImagePollTargetFromEvent(event))
+	if event["type"] == "moderation" {
+		moderation := util.StringMap(event["moderation_response"])
+		if util.ToBool(moderation["blocked"]) {
+			state.Blocked = true
+		}
+	}
+	if event["type"] == "server_ste_metadata" {
+		metadata := util.StringMap(event["metadata"])
+		if toolInvoked, ok := metadata["tool_invoked"].(bool); ok {
+			state.ToolInvoked = &toolInvoked
+		}
+		if turnUseCase := util.Clean(metadata["turn_use_case"]); turnUseCase != "" {
+			state.TurnUseCase = turnUseCase
+		}
+	}
+	if isOfficialImageToolEvent(event) {
+		state.FileIDs = appendUniqueString(state.FileIDs, fileIDs...)
+		state.SedimentIDs = appendUniqueString(state.SedimentIDs, sedimentIDs...)
+		if text := officialImageTextMessage(event); text != "" {
+			state.Text = text
+		}
+		return
+	}
+	if text := officialImageAssistantText(event); text != "" {
+		state.Text = text
+	}
+}
+
+func officialImagePollTargetFromEvent(event map[string]any) officialImagePollTarget {
+	target := officialImagePollTarget{}
+	mergeMetadata := func(metadata map[string]any) {
+		if len(metadata) == 0 {
+			return
+		}
+		if turnExchangeID := util.Clean(metadata["turn_exchange_id"]); turnExchangeID != "" {
+			target.TurnExchangeID = turnExchangeID
+		}
+		if imageGenTaskID := util.Clean(metadata["image_gen_task_id"]); imageGenTaskID != "" {
+			target.ImageGenTaskID = imageGenTaskID
+		}
+		for _, key := range []string{"message_id", "parent_id"} {
+			if id := util.Clean(metadata[key]); id != "" {
+				target.MessageIDs = appendUniqueString(target.MessageIDs, id)
+			}
+		}
+	}
+	mergeMessage := func(message map[string]any) {
+		if len(message) == 0 {
+			return
+		}
+		if id := util.Clean(message["id"]); id != "" {
+			target.MessageIDs = appendUniqueString(target.MessageIDs, id)
+		}
+		mergeMetadata(util.StringMap(message["metadata"]))
+	}
+	mergeMetadata(util.StringMap(event["metadata"]))
+	if id := util.Clean(event["message_id"]); id != "" {
+		target.MessageIDs = appendUniqueString(target.MessageIDs, id)
+	}
+	mergeMessage(util.StringMap(event["message"]))
+	value := util.StringMap(event["v"])
+	mergeMessage(util.StringMap(value["message"]))
+	if target.TurnExchangeID == "" && target.ImageGenTaskID == "" {
+		target.MessageIDs = nil
+	}
+	return target
+}
+
+func mergeOfficialImagePollTarget(current, incoming officialImagePollTarget) officialImagePollTarget {
+	if !incoming.hasTarget() {
+		return current
+	}
+	if incoming.TurnExchangeID != "" && current.TurnExchangeID != "" && incoming.TurnExchangeID != current.TurnExchangeID {
+		current = officialImagePollTarget{}
+	}
+	if incoming.ImageGenTaskID != "" && current.ImageGenTaskID != "" && incoming.ImageGenTaskID != current.ImageGenTaskID {
+		current = officialImagePollTarget{}
+	}
+	if incoming.TurnExchangeID != "" {
+		current.TurnExchangeID = incoming.TurnExchangeID
+	}
+	if incoming.ImageGenTaskID != "" {
+		current.ImageGenTaskID = incoming.ImageGenTaskID
+	}
+	current.MessageIDs = appendUniqueString(current.MessageIDs, incoming.MessageIDs...)
+	return current
+}
+
+func assistantMessageIDFromOfficialImagePayload(event map[string]any) string {
+	if id := assistantMessageIDFromOfficialMessage(util.StringMap(event["message"])); id != "" {
+		return id
+	}
+	if id := util.Clean(event["message_id"]); id != "" {
+		return id
+	}
+	value := util.StringMap(event["v"])
+	return assistantMessageIDFromOfficialMessage(util.StringMap(value["message"]))
+}
+
+func officialInterpreterAssetsFromEvent(event map[string]any, fallbackConversationID string) []officialInterpreterAsset {
+	message := util.StringMap(event["message"])
+	if !isOfficialCodeInterpreterAssistantMessage(message) {
+		return nil
+	}
+	messageID := util.Clean(message["id"])
+	conversationID := firstNonEmpty(util.Clean(event["conversation_id"]), fallbackConversationID)
+	content := util.StringMap(message["content"])
+	var assets []officialInterpreterAsset
+	for _, rawAsset := range anySlice(content["assets"]) {
+		asset := util.StringMap(rawAsset)
+		assetID := util.Clean(asset["asset_id"])
+		mimeType := strings.TrimSpace(util.Clean(asset["mime_type"]))
+		if assetID == "" || !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+			continue
+		}
+		assets = append(assets, officialInterpreterAsset{
+			AssetID:        assetID,
+			MessageID:      messageID,
+			ConversationID: conversationID,
+			FileName:       util.Clean(asset["file_name"]),
+			MIMEType:       mimeType,
+			Width:          util.ToInt(asset["width"], 0),
+			Height:         util.ToInt(asset["height"], 0),
+		})
+	}
+	return assets
+}
+
+func isOfficialCodeInterpreterAssistantMessage(message map[string]any) bool {
+	if len(message) == 0 {
+		return false
+	}
+	author := util.StringMap(message["author"])
+	if !strings.EqualFold(util.Clean(author["role"]), "assistant") {
+		return false
+	}
+	metadata := util.StringMap(message["metadata"])
+	return util.Clean(metadata["async_task_type"]) == "code_interpreter" || util.Clean(metadata["tool"]) == "code_interpreter"
+}
+
+func assistantMessageIDFromOfficialMessage(message map[string]any) string {
+	id := util.Clean(message["id"])
+	if id == "" {
+		return ""
+	}
+	author := util.StringMap(message["author"])
+	role := util.Clean(author["role"])
+	if role != "" && !strings.EqualFold(role, "assistant") {
+		return ""
+	}
+	return id
+}
+
+func extractOfficialConversationIDs(payload string) (string, []string, []string) {
+	conversation := ""
+	if match := regexp.MustCompile(`"conversation_id"\s*:\s*"([^"]+)"`).FindStringSubmatch(payload); len(match) > 1 {
+		conversation = match[1]
+	}
+	fileIDs := regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(payload, -1)
+	files := make([]string, 0, len(fileIDs))
+	for _, match := range fileIDs {
+		if len(match) > 1 {
+			files = appendUniqueString(files, match[1])
+		}
+	}
+	sedimentIDs := regexp.MustCompile(`sediment://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(payload, -1)
+	sediments := make([]string, 0, len(sedimentIDs))
+	for _, match := range sedimentIDs {
+		if len(match) > 1 {
+			sediments = appendUniqueString(sediments, match[1])
+		}
+	}
+	return conversation, files, sediments
+}
+
+func isOfficialImageToolEvent(event map[string]any) bool {
+	value := util.StringMap(event["v"])
+	message := util.StringMap(event["message"])
+	if len(message) == 0 {
+		message = util.StringMap(value["message"])
+	}
+	metadata := util.StringMap(message["metadata"])
+	author := util.StringMap(message["author"])
+	if !strings.EqualFold(util.Clean(author["role"]), "tool") {
+		return false
+	}
+	return util.Clean(metadata["async_task_type"]) == "image_gen" || officialImageMessageHasAssetPointer(message)
+}
+
+func officialImageMessageHasAssetPointer(message map[string]any) bool {
+	content := util.StringMap(message["content"])
+	if util.Clean(content["content_type"]) != "multimodal_text" {
+		return false
+	}
+	parts, _ := content["parts"].([]any)
+	for _, rawPart := range parts {
+		switch part := rawPart.(type) {
+		case map[string]any:
+			if util.Clean(part["content_type"]) == "image_asset_pointer" {
+				return true
+			}
+			if isOfficialImageAssetPointer(util.Clean(part["asset_pointer"])) {
+				return true
+			}
+		case string:
+			if isOfficialImageAssetPointer(part) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isOfficialImageAssetPointer(value string) bool {
+	value = strings.TrimSpace(value)
+	return strings.HasPrefix(value, "file-service://") || strings.HasPrefix(value, "sediment://")
+}
+
+func officialImageAssistantText(event map[string]any) string {
+	for _, candidate := range []any{event, event["v"]} {
+		message := util.StringMap(util.StringMap(candidate)["message"])
+		author := util.StringMap(message["author"])
+		if !strings.EqualFold(util.Clean(author["role"]), "assistant") {
+			continue
+		}
+		if text := officialImageMessageText(message); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func officialImageTextMessage(event map[string]any) string {
+	for _, candidate := range []any{event, event["v"]} {
+		message := util.StringMap(util.StringMap(candidate)["message"])
+		if len(message) == 0 {
+			continue
+		}
+		if text := officialImageMessageText(message); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func officialImageMessageText(message map[string]any) string {
+	content := util.StringMap(message["content"])
+	parts, _ := content["parts"].([]any)
+	var out []string
+	for _, part := range parts {
+		if text, ok := part.(string); ok && strings.TrimSpace(text) != "" {
+			out = append(out, strings.TrimSpace(text))
+			continue
+		}
+		if item, ok := part.(map[string]any); ok {
+			if text := strings.TrimSpace(util.Clean(item["text"])); text != "" {
+				out = append(out, text)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func (c *Client) resolveOfficialImageResults(ctx context.Context, request ResponsesImageRequest, event ResponsesImageEvent) ([]ResponsesImageEvent, error) {
+	conversationID := strings.TrimSpace(event.ConversationID)
+	messageID := strings.TrimSpace(event.MessageID)
+	if len(event.interpreterAssets) > 0 {
+		return c.resolveOfficialInterpreterAssetResults(ctx, request, event.interpreterAssets, conversationID, messageID)
+	}
+	fileIDs := filterOfficialImageIDs(event.FileIDs)
+	sedimentIDs := filterOfficialImageIDs(event.SedimentIDs)
+	text := ""
+	if conversationID != "" && len(fileIDs) == 0 && len(sedimentIDs) == 0 {
+		polled, err := c.pollOfficialImageResults(ctx, conversationID, event.pollTarget)
+		if err != nil {
+			return nil, err
+		}
+		fileIDs = appendUniqueString(fileIDs, polled.FileIDs...)
+		sedimentIDs = appendUniqueString(sedimentIDs, polled.SedimentIDs...)
+		text = polled.Text
+		if messageID == "" {
+			messageID = polled.MessageID
+		}
+	}
+	imageFileIDs := officialImageFileIDs(fileIDs, sedimentIDs)
+	if len(imageFileIDs) == 0 {
+		if strings.TrimSpace(text) != "" {
+			return []ResponsesImageEvent{{
+				Type:           "image_text_response",
+				MessageID:      messageID,
+				Text:           strings.TrimSpace(text),
+				Created:        time.Now().Unix(),
+				ConversationID: conversationID,
+			}}, nil
+		}
+		return nil, nil
+	}
+	results := make([]ResponsesImageEvent, 0, len(imageFileIDs))
+	for index, fileID := range imageFileIDs {
+		data, downloadErr := c.downloadOfficialImageFile(ctx, conversationID, fileID)
+		if downloadErr != nil {
+			return nil, downloadErr
+		}
+		results = append(results, ResponsesImageEvent{
+			Type:           "image_result",
+			ItemID:         fmt.Sprintf("image_%d", index+1),
+			MessageID:      messageID,
+			Result:         base64.StdEncoding.EncodeToString(data),
+			RevisedPrompt:  strings.TrimSpace(request.Prompt),
+			OutputFormat:   "png",
+			Created:        time.Now().Unix(),
+			ConversationID: conversationID,
+			FileIDs:        append([]string(nil), fileIDs...),
+			SedimentIDs:    append([]string(nil), sedimentIDs...),
+		})
+	}
+	return results, nil
+}
+
+func (c *Client) resolveOfficialInterpreterAssetResults(ctx context.Context, request ResponsesImageRequest, assets []officialInterpreterAsset, fallbackConversationID, fallbackMessageID string) ([]ResponsesImageEvent, error) {
+	results := make([]ResponsesImageEvent, 0, len(assets))
+	for index, asset := range assets {
+		conversationID := firstNonEmpty(strings.TrimSpace(asset.ConversationID), fallbackConversationID)
+		messageID := firstNonEmpty(strings.TrimSpace(asset.MessageID), fallbackMessageID)
+		data, err := c.downloadOfficialInterpreterAsset(ctx, conversationID, asset.AssetID, messageID)
+		if err != nil {
+			return nil, err
+		}
+		outputFormat := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(asset.MIMEType)), "image/")
+		if outputFormat == "" || outputFormat == "jpeg" {
+			outputFormat = "png"
+		}
+		results = append(results, ResponsesImageEvent{
+			Type:           "image_result",
+			ItemID:         fmt.Sprintf("image_%d", index+1),
+			MessageID:      messageID,
+			Result:         base64.StdEncoding.EncodeToString(data),
+			RevisedPrompt:  strings.TrimSpace(request.Prompt),
+			OutputFormat:   outputFormat,
+			Created:        time.Now().Unix(),
+			ConversationID: conversationID,
+		})
+	}
+	return results, nil
+}
+
+func officialImageFileIDs(fileIDs, sedimentIDs []string) []string {
+	out := appendUniqueString(nil, filterOfficialImageIDs(fileIDs)...)
+	for _, sedimentID := range sedimentIDs {
+		out = appendUniqueString(out, sedimentID)
+	}
+	return out
+}
+
+func filterOfficialImageIDs(values []string) []string {
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || value == "file_upload" {
+			continue
+		}
+		out = appendUniqueString(out, value)
+	}
+	return out
+}
+
+type officialConversationPollResult struct {
+	FileIDs     []string
+	SedimentIDs []string
+	Text        string
+	MessageID   string
+}
+
+func (c *Client) pollOfficialImageResults(ctx context.Context, conversationID string, target officialImagePollTarget) (officialConversationPollResult, error) {
+	if strings.TrimSpace(conversationID) == "" {
+		return officialConversationPollResult{}, nil
+	}
+	delay := 4 * time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return officialConversationPollResult{}, ctx.Err()
+		default:
+		}
+		result, err := c.fetchOfficialConversationImageResult(ctx, conversationID, target)
+		if err != nil {
+			if retry, ok := err.(officialConversationPollRetryError); ok {
+				delay = retry.Delay
+			} else {
+				return officialConversationPollResult{}, err
+			}
+		}
+		if len(result.FileIDs) > 0 || len(result.SedimentIDs) > 0 || strings.TrimSpace(result.Text) != "" {
+			return result, nil
+		}
+		select {
+		case <-ctx.Done():
+			return officialConversationPollResult{}, ctx.Err()
+		case <-time.After(delay):
+		}
+		delay = 4 * time.Second
+	}
+}
+
+type officialConversationPollRetryError struct {
+	Delay time.Duration
+}
+
+func (e officialConversationPollRetryError) Error() string {
+	return "official conversation poll rate limited"
+}
+
+func (c *Client) fetchOfficialConversationImageResult(ctx context.Context, conversationID string, target officialImagePollTarget) (officialConversationPollResult, error) {
+	path := "/backend-api/conversation/" + conversationID
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	for key, value := range c.headers(path, map[string]string{"Accept": "application/json"}) {
+		req.Header.Set(key, value)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return officialConversationPollResult{}, upstreamTransportError(path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		io.Copy(io.Discard, resp.Body)
+		return officialConversationPollResult{}, officialConversationPollRetryError{Delay: officialConversationPollRetryDelay(resp.Header.Get("Retry-After"))}
+	}
+	if err := ensureOK(resp, path); err != nil {
+		return officialConversationPollResult{}, err
+	}
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return officialConversationPollResult{}, err
+	}
+	return officialConversationPollResultFromDataForTarget(data, target), nil
+}
+
+func officialConversationPollResultFromData(data map[string]any) officialConversationPollResult {
+	return officialConversationPollResultFromDataForTarget(data, officialImagePollTarget{})
+}
+
+func officialConversationPollResultFromDataForTarget(data map[string]any, target officialImagePollTarget) officialConversationPollResult {
+	text := officialConversationAssistantText(data)
+	messageID := officialConversationAssistantMessageID(data)
+	var fileIDs []string
+	var sedimentIDs []string
+	for _, message := range latestOfficialConversationImageToolMessagesForTarget(data, target) {
+		messageFileIDs, messageSedimentIDs := officialImageAssetPointersFromMessage(message)
+		fileIDs = appendUniqueString(fileIDs, messageFileIDs...)
+		sedimentIDs = appendUniqueString(sedimentIDs, messageSedimentIDs...)
+	}
+	if len(fileIDs) > 0 || len(sedimentIDs) > 0 || isPendingOfficialImageText(text) || target.hasTarget() {
+		text = ""
+	}
+	return officialConversationPollResult{FileIDs: fileIDs, SedimentIDs: sedimentIDs, Text: text, MessageID: messageID}
+}
+
+func latestOfficialConversationImageToolMessages(data map[string]any) []map[string]any {
+	return latestOfficialConversationImageToolMessagesForTarget(data, officialImagePollTarget{})
+}
+
+func latestOfficialConversationImageToolMessagesForTarget(data map[string]any, target officialImagePollTarget) []map[string]any {
+	mapping := util.StringMap(data["mapping"])
+	var messages []map[string]any
+	bestTime := -1.0
+	for key, raw := range mapping {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		message := util.StringMap(node["message"])
+		if !isOfficialConversationImageToolMessage(message) {
+			continue
+		}
+		if target.hasTarget() && !officialConversationNodeMatchesPollTarget(key, node, message, mapping, target, map[string]bool{}) {
+			continue
+		}
+		fileIDs, sedimentIDs := officialImageAssetPointersFromMessage(message)
+		if len(fileIDs) == 0 && len(sedimentIDs) == 0 {
+			continue
+		}
+		messageTime := officialImageMessageTimestamp(message)
+		if messageTime > bestTime {
+			messages = []map[string]any{message}
+			bestTime = messageTime
+			continue
+		}
+		if messageTime == bestTime {
+			messages = append(messages, message)
+		}
+	}
+	return messages
+}
+
+func officialConversationNodeMatchesPollTarget(key string, node, message map[string]any, mapping map[string]any, target officialImagePollTarget, seen map[string]bool) bool {
+	if !target.hasTarget() {
+		return true
+	}
+	if key != "" {
+		if seen[key] {
+			return false
+		}
+		seen[key] = true
+	}
+	if officialConversationMessageMatchesPollTarget(key, node, message, target) {
+		return true
+	}
+	parentKey := firstNonEmpty(util.Clean(node["parent"]), util.Clean(node["parent_id"]))
+	if parentKey == "" {
+		return false
+	}
+	parentNode := util.StringMap(mapping[parentKey])
+	if len(parentNode) == 0 {
+		return officialImagePollTargetContainsMessageID(target, parentKey)
+	}
+	return officialConversationNodeMatchesPollTarget(parentKey, parentNode, util.StringMap(parentNode["message"]), mapping, target, seen)
+}
+
+func officialConversationMessageMatchesPollTarget(key string, node, message map[string]any, target officialImagePollTarget) bool {
+	metadata := util.StringMap(message["metadata"])
+	if target.TurnExchangeID != "" && util.Clean(metadata["turn_exchange_id"]) == target.TurnExchangeID {
+		return true
+	}
+	if target.ImageGenTaskID != "" && util.Clean(metadata["image_gen_task_id"]) == target.ImageGenTaskID {
+		return true
+	}
+	for _, id := range []string{
+		key,
+		util.Clean(message["id"]),
+		util.Clean(metadata["message_id"]),
+		util.Clean(metadata["parent_id"]),
+		util.Clean(node["parent"]),
+		util.Clean(node["parent_id"]),
+	} {
+		if officialImagePollTargetContainsMessageID(target, id) {
+			return true
+		}
+	}
+	return false
+}
+
+func officialImagePollTargetContainsMessageID(target officialImagePollTarget, id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	for _, candidate := range target.MessageIDs {
+		if strings.TrimSpace(candidate) == id {
+			return true
+		}
+	}
+	return false
+}
+
+func isOfficialConversationImageToolMessage(message map[string]any) bool {
+	if len(message) == 0 {
+		return false
+	}
+	author := util.StringMap(message["author"])
+	if !strings.EqualFold(util.Clean(author["role"]), "tool") {
+		return false
+	}
+	content := util.StringMap(message["content"])
+	if util.Clean(content["content_type"]) != "multimodal_text" {
+		return false
+	}
+	metadata := util.StringMap(message["metadata"])
+	return util.Clean(metadata["async_task_type"]) == "image_gen" || officialImageMessageHasAssetPointer(message)
+}
+
+func officialImageAssetPointersFromMessage(message map[string]any) ([]string, []string) {
+	content := util.StringMap(message["content"])
+	parts, _ := content["parts"].([]any)
+	var fileIDs []string
+	var sedimentIDs []string
+	for _, rawPart := range parts {
+		text := ""
+		switch part := rawPart.(type) {
+		case map[string]any:
+			text = util.Clean(part["asset_pointer"])
+		case string:
+			text = part
+		}
+		for _, match := range regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(text, -1) {
+			if len(match) > 1 {
+				fileIDs = appendUniqueString(fileIDs, match[1])
+			}
+		}
+		for _, match := range regexp.MustCompile(`sediment://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(text, -1) {
+			if len(match) > 1 {
+				sedimentIDs = appendUniqueString(sedimentIDs, match[1])
+			}
+		}
+	}
+	return fileIDs, sedimentIDs
+}
+
+func officialConversationPollRetryDelay(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 4 * time.Second
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		if seconds > 30 {
+			seconds = 30
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		delay := time.Until(when)
+		if delay > 0 {
+			if delay > 30*time.Second {
+				return 30 * time.Second
+			}
+			return delay
+		}
+	}
+	return 4 * time.Second
+}
+
+func (c *Client) fetchOfficialConversationText(ctx context.Context, conversationID string) (string, error) {
+	path := "/backend-api/conversation/" + conversationID
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	for key, value := range c.headers(path, map[string]string{"Accept": "application/json"}) {
+		req.Header.Set(key, value)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", upstreamTransportError(path, err)
+	}
+	defer resp.Body.Close()
+	if err := ensureOK(resp, path); err != nil {
+		return "", err
+	}
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
+	}
+	return officialConversationAssistantText(data), nil
+}
+
+func officialConversationAssistantText(data map[string]any) string {
+	message := latestOfficialConversationAssistantMessage(data)
+	return strings.TrimSpace(officialImageMessageText(message))
+}
+
+func officialConversationAssistantMessageID(data map[string]any) string {
+	return util.Clean(latestOfficialConversationAssistantMessage(data)["id"])
+}
+
+func latestOfficialConversationAssistantMessage(data map[string]any) map[string]any {
+	mapping := util.StringMap(data["mapping"])
+	var bestMessage map[string]any
+	bestTime := -1.0
+	for _, raw := range mapping {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		message := util.StringMap(node["message"])
+		if !isOfficialVisibleAssistantMessage(message) {
+			continue
+		}
+		messageTime := officialImageMessageTimestamp(message)
+		if bestMessage == nil || messageTime >= bestTime {
+			bestMessage = message
+			bestTime = messageTime
+		}
+	}
+	return bestMessage
+}
+
+func isOfficialVisibleAssistantMessage(message map[string]any) bool {
+	if len(message) == 0 {
+		return false
+	}
+	author := util.StringMap(message["author"])
+	if !strings.EqualFold(util.Clean(author["role"]), "assistant") {
+		return false
+	}
+	recipient := util.Clean(message["recipient"])
+	if recipient != "" && !strings.EqualFold(recipient, "all") {
+		return false
+	}
+	metadata := util.StringMap(message["metadata"])
+	if util.ToBool(metadata["is_visually_hidden_from_conversation"]) {
+		return false
+	}
+	return true
+}
+
+func officialImageMessageTimestamp(message map[string]any) float64 {
+	for _, key := range []string{"update_time", "create_time"} {
+		switch value := message[key].(type) {
+		case float64:
+			if value > 0 {
+				return value
+			}
+		case int:
+			if value > 0 {
+				return float64(value)
+			}
+		case int64:
+			if value > 0 {
+				return float64(value)
+			}
+		case json.Number:
+			if parsed, err := strconv.ParseFloat(value.String(), 64); err == nil && parsed > 0 {
+				return parsed
+			}
+		case string:
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil && parsed > 0 {
+				return parsed
+			}
+		}
+	}
+	return 0
+}
+
+func (c *Client) downloadOfficialInterpreterAsset(ctx context.Context, conversationID, assetID, messageID string) ([]byte, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	assetID = strings.TrimSpace(assetID)
+	messageID = strings.TrimSpace(messageID)
+	if conversationID == "" {
+		return nil, fmt.Errorf("conversation_id is required for official interpreter asset download")
+	}
+	if assetID == "" {
+		return nil, fmt.Errorf("asset_id is required for official interpreter asset download")
+	}
+	if messageID == "" {
+		return nil, fmt.Errorf("message_id is required for official interpreter asset download")
+	}
+	query := urlpkg.Values{}
+	query.Set("asset_id", assetID)
+	query.Set("message_id", messageID)
+	targetPath := "/backend-api/conversation/" + urlpkg.PathEscape(conversationID) + "/interpreter/download"
+	path := targetPath + "?" + query.Encode()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	for key, value := range c.headers(targetPath, map[string]string{"Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"}) {
+		req.Header.Set(key, value)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, upstreamTransportError(path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return nil, upstreamHTTPError(path, resp.StatusCode, data)
+	}
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if contentType != "" && !strings.HasPrefix(contentType, "image/") {
+		return nil, fmt.Errorf("official interpreter asset %s returned non-image content type %s", assetID, contentType)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+func (c *Client) getOfficialFileDownloadURL(ctx context.Context, conversationID, fileID string) (string, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return "", fmt.Errorf("conversation_id is required for official image download")
+	}
+	query := urlpkg.Values{}
+	query.Set("conversation_id", conversationID)
+	query.Set("inline", "false")
+	targetPath := "/backend-api/files/download/" + urlpkg.PathEscape(fileID)
+	path := targetPath + "?" + query.Encode()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	for key, value := range c.headers(targetPath, map[string]string{"Accept": "application/json"}) {
+		req.Header.Set(key, value)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", upstreamTransportError(path, err)
+	}
+	defer resp.Body.Close()
+	if err := ensureOK(resp, path); err != nil {
+		return "", err
+	}
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
+	}
+	return firstNonEmpty(util.Clean(data["download_url"]), util.Clean(data["url"])), nil
+}
+
+func (c *Client) downloadOfficialImageFile(ctx context.Context, conversationID, fileID string) ([]byte, error) {
+	var lastErr error
+	for attempt := 1; attempt <= officialImageDownloadAttempts; attempt++ {
+		downloadURL, err := c.getOfficialFileDownloadURL(ctx, conversationID, fileID)
+		if err == nil && strings.TrimSpace(downloadURL) == "" {
+			err = fmt.Errorf("official image file %s returned empty download URL", fileID)
+		}
+		if err == nil {
+			var data []byte
+			data, err = c.downloadOfficialImage(ctx, downloadURL)
+			if err == nil {
+				return data, nil
+			}
+		}
+		lastErr = err
+		if attempt == officialImageDownloadAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(officialImageDownloadRetryDelay):
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) downloadOfficialImage(ctx context.Context, url string) ([]byte, error) {
+	target := strings.TrimSpace(url)
+	parsed, err := urlpkg.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	if !parsed.IsAbs() {
+		base, baseErr := urlpkg.Parse(c.BaseURL)
+		if baseErr != nil {
+			return nil, baseErr
+		}
+		parsed = base.ResolveReference(parsed)
+		target = parsed.String()
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if c.isChatGPTBackendURL(parsed) {
+		path := parsed.EscapedPath()
+		for key, value := range c.headers(path, map[string]string{"Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"}) {
+			req.Header.Set(key, value)
+		}
+	} else if c.userAgent != "" {
+		req.Header.Set("User-Agent", c.userAgent)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, upstreamTransportError("image_download", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return nil, upstreamHTTPError("image_download", resp.StatusCode, data)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+func (c *Client) isChatGPTBackendURL(parsed *urlpkg.URL) bool {
+	if parsed == nil {
+		return false
+	}
+	base, err := urlpkg.Parse(c.BaseURL)
+	if err != nil || base.Host == "" {
+		return false
+	}
+	if !strings.EqualFold(parsed.Host, base.Host) {
+		return false
+	}
+	path := parsed.EscapedPath()
+	return strings.HasPrefix(path, "/backend-api/") || strings.HasPrefix(path, "/backend-anon/")
+}
+
+func appendUniqueString(base []string, values ...string) []string {
+	seen := map[string]struct{}{}
+	for _, item := range base {
+		if strings.TrimSpace(item) == "" {
+			continue
+		}
+		seen[item] = struct{}{}
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		base = append(base, value)
+	}
+	return base
+}
+
+func (c *Client) chatGPTAccountID() string {
+	if c == nil || c.lookup == nil || strings.TrimSpace(c.AccessToken) == "" {
+		return ""
+	}
+	account := c.lookup.GetAccount(c.AccessToken)
+	return firstNonEmpty(
+		util.Clean(account["chatgpt_account_id"]),
+		util.Clean(account["account_id"]),
+		util.Clean(account["user_id"]),
+	)
+}
