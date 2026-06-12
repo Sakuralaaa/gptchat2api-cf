@@ -16,8 +16,42 @@
 > [!CAUTION]
 > 公网部署时请务必添加外部访问控制，不要暴露敏感配置、账号 Token、数据库连接串或管理端入口。旧版本可能存在已知漏洞，请尽快升级到最新版本。
 
+## 本 Fork 的改动
+
+本 Fork 在上游基础上专注优化**自动注册成功率**，主要解决两类失败：注册首步被 Cloudflare 盾拦截（HTTP 403 `Just a moment...`），以及独立登录换 token 阶段的 `invalid_state` 409。
+
+### 1. 接入 FlareSolverr 过 Cloudflare 盾
+
+注册流程的第一步 `platform authorize`（`GET https://auth.openai.com/api/accounts/authorize`）以及整个 `auth.openai.com` 域都在 Cloudflare 保护之后。原版用裸 `net/http` 客户端直接请求，容易吃到 CF challenge 导致 `platform_authorize_http_403`。
+
+**思路**：每个注册任务（worker）启动时，先用你自部署的 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) 对 `auth.openai.com` 预热一次，拿到通过挑战后的 `cf_clearance` cookie 与浏览器 `User-Agent`，注入注册客户端的 cookie jar，后续请求复用，从而绕过盾。
+
+关键细节：
+- `cf_clearance` 与解出它时的 **User-Agent 和出口 IP 强绑定**。因此预热拿到 UA 后，注册流程所有请求都强制使用该 UA；调用 FlareSolverr 时也会把注册任务配置的代理一并透传，保证出口 IP 一致，否则 clearance 会立刻失效。
+- 仅用 FlareSolverr 做一次性预热（`request.get`），后续真实请求仍走原生 HTTP 客户端，兼顾速度与稳定。
+
+**使用方式**：在管理端「注册配置」页填入你的 FlareSolverr 地址（如 `http://127.0.0.1:8191`）即可；留空则跳过预热、行为与上游一致。
+
+### 2. 独立登录 session 隔离 + 409 重试
+
+注册主流程（authorize → 注册密码 → OTP → 创建账号）完成后，需要再走一遍「独立登录」来换取 access/refresh token。原版此步**复用了主流程的同一个 session 和 device id**，此时该 session 的 auth cookie 处于「已登录但 authorize state 失效」的脏状态，重新 authorize 后提交邮箱就会得到 `email_submit_http_409 invalid_state`，且仅重试 1 次仍用脏 session，往往再次失败。
+
+**思路**（移植自社区 1.1.4 + PR192 的修复）：
+- 独立登录使用**全新的 cookie jar 和全新的 device id**，与主注册流程完全隔离（代理/TLS transport 仍复用主客户端，并注入预热得到的 `cf_clearance` 与 UA，避免新 session 重新撞盾）。
+- 邮箱提交、密码校验各自最多重试 **3 次**；每次遇到 409 时**清空 `auth.openai.com` 的所有 cookie**、重新 authorize 后再试，从干净状态重新开始。
+
+### 调优建议
+
+- **验证码超时**（`waiting for register verification code timed out`）通常是并发过高导致邮箱服务来不及收信。建议在「注册配置」中把**线程数调低**（如 8~16），并把**等待验证码超时调高**（如 60s）。
+- 若 FlareSolverr 预热日志持续显示「注入 0 个 cookie」，说明该次访问 `auth.openai.com` 未触发 CF 挑战（无 `cf_clearance` 可取）；只要后续请求未被 403 拦截即属正常。若再次出现大面积 403，请检查 FlareSolverr 自身是否正常工作。
+
+### 镜像构建
+
+推送到 `main` 分支会通过 GitHub Actions 自动构建并推送容器镜像到 `ghcr.io/<owner>/<repo>:latest`。
+
 ## 目录
 
+- [本 Fork 的改动](#本-fork-的改动)
 - [快速入口](#快速入口)
 - [项目能力](#项目能力)
 - [快速部署](#快速部署)
