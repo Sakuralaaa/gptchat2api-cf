@@ -1106,16 +1106,22 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": a.config.Proxy()}})
+		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": a.config.Proxy(), "flaresolverr": a.config.FlareSolverr()}})
 	case http.MethodPost:
 		body, _ := readJSONMap(r)
-		url := util.Clean(body["url"])
-		updated, err := a.config.Update(map[string]any{"proxy": url})
+		updates := map[string]any{}
+		if _, ok := body["url"]; ok {
+			updates["proxy"] = util.Clean(body["url"])
+		}
+		if _, ok := body["flaresolverr"]; ok {
+			updates["flaresolverr"] = util.Clean(body["flaresolverr"])
+		}
+		updated, err := a.config.Update(updates)
 		if err != nil {
 			util.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": updated["proxy"]}})
+		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": updated["proxy"], "flaresolverr": updated["flaresolverr"]}})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}

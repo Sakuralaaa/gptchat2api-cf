@@ -41,11 +41,6 @@ const (
 	registerSentinelSDK              = registerSentinelBase + "/sentinel/20260124ceb8/sdk.js"
 	registerSentinelMaxAttempts      = 500000
 	registerSentinelErrorPrefix      = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
-
-	// FlareSolverr is used to pass the Cloudflare challenge guarding auth.openai.com.
-	// We solve once at worker startup and reuse the returned cf_clearance cookie and
-	// User-Agent for the subsequent native HTTP requests.
-	registerFlareSolverrMaxTimeout = 120000
 )
 
 var (
@@ -860,7 +855,7 @@ func (w *registerWorker) prewarmCloudflare(ctx context.Context) error {
 		return nil
 	}
 	w.step("开始通过 FlareSolverr 预热 Cloudflare 盾")
-	userAgent, cookies, err := w.solveCloudflareChallenge(ctx, endpoint, registerAuthBase+"/")
+	userAgent, cookies, err := SolveCloudflareChallenge(ctx, endpoint, registerAuthBase+"/", util.Clean(w.config["proxy"]))
 	if err != nil {
 		return fmt.Errorf("flaresolverr_prewarm_failed: %w", err)
 	}
@@ -871,74 +866,6 @@ func (w *registerWorker) prewarmCloudflare(ctx context.Context) error {
 	injected := w.injectCloudflareCookies(w.client, cookies)
 	w.step(fmt.Sprintf("FlareSolverr 预热完成，注入 %d 个 cookie", injected))
 	return nil
-}
-
-func (w *registerWorker) solveCloudflareChallenge(ctx context.Context, endpoint, target string) (string, []*http.Cookie, error) {
-	base := strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	if !strings.HasSuffix(base, "/v1") {
-		base += "/v1"
-	}
-	reqBody := map[string]any{
-		"cmd":        "request.get",
-		"url":        target,
-		"maxTimeout": registerFlareSolverrMaxTimeout,
-	}
-	if proxy := strings.TrimSpace(util.Clean(w.config["proxy"])); proxy != "" {
-		reqBody["proxy"] = map[string]any{"url": proxy}
-	}
-	data, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", nil, err
-	}
-	timeout := time.Duration(registerFlareSolverrMaxTimeout)*time.Millisecond + 30*time.Second
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, base, bytes.NewReader(data))
-	if err != nil {
-		return "", nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", nil, err
-	}
-	defer resp.Body.Close()
-	var payload struct {
-		Status   string `json:"status"`
-		Message  string `json:"message"`
-		Solution struct {
-			UserAgent string `json:"userAgent"`
-			Status    int    `json:"status"`
-			Cookies   []struct {
-				Name   string `json:"name"`
-				Value  string `json:"value"`
-				Domain string `json:"domain"`
-				Path   string `json:"path"`
-			} `json:"cookies"`
-		} `json:"solution"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", nil, err
-	}
-	if !strings.EqualFold(payload.Status, "ok") {
-		return "", nil, fmt.Errorf("flaresolverr status=%q message=%q", payload.Status, payload.Message)
-	}
-	cookies := make([]*http.Cookie, 0, len(payload.Solution.Cookies))
-	for _, item := range payload.Solution.Cookies {
-		if strings.TrimSpace(item.Name) == "" {
-			continue
-		}
-		// Domain is intentionally left empty so the cookie jar binds it to the
-		// auth.openai.com request URL used in injectCloudflareCookies. FlareSolverr
-		// may return a leading-dot domain that some jars reject during SetCookies.
-		cookies = append(cookies, &http.Cookie{
-			Name:  item.Name,
-			Value: item.Value,
-			Path:  firstNonEmpty(item.Path, "/"),
-		})
-	}
-	return payload.Solution.UserAgent, cookies, nil
 }
 
 func (w *registerWorker) injectCloudflareCookies(client *http.Client, cookies []*http.Cookie) int {

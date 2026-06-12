@@ -21,6 +21,7 @@ import (
 var settingEnvKeys = map[string]string{
 	"base_url":                          "CHATGPT2API_BASE_URL",
 	"proxy":                             "CHATGPT2API_PROXY",
+	"flaresolverr":                      "CHATGPT2API_FLARESOLVERR",
 	"refresh_account_interval_minute":   "CHATGPT2API_REFRESH_ACCOUNT_INTERVAL_MINUTE",
 	"image_task_timeout_seconds":        "CHATGPT2API_IMAGE_TASK_TIMEOUT_SECONDS",
 	"user_default_concurrent_limit":     "CHATGPT2API_USER_DEFAULT_CONCURRENT_LIMIT",
@@ -299,6 +300,10 @@ func (s *Store) Proxy() string {
 	return strings.TrimSpace(fmt.Sprint(s.settingValue("proxy", "")))
 }
 
+func (s *Store) FlareSolverr() string {
+	return strings.TrimSpace(fmt.Sprint(s.settingValue("flaresolverr", "")))
+}
+
 func (s *Store) UpdateProxyURL() string {
 	if value := strings.TrimSpace(os.Getenv("CHATGPT2API_UPDATE_PROXY_URL")); value != "" {
 		return value
@@ -453,6 +458,7 @@ func (s *Store) Get() map[string]any {
 	data["auto_remove_rate_limited_accounts"] = s.AutoRemoveRateLimitedAccounts()
 	data["log_levels"] = s.LogLevels()
 	data["proxy"] = s.Proxy()
+	data["flaresolverr"] = s.FlareSolverr()
 	data["base_url"] = s.BaseURL()
 	data["registration_enabled"] = s.RegistrationEnabled()
 	linuxdo := s.LinuxDoOAuth()

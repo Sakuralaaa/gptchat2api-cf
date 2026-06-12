@@ -25,6 +25,8 @@ export function ProxySettingsCard() {
   const [settings, setSettings] = useState<ProxySettings>({ enabled: false, url: "" });
   const [formUrl, setFormUrl] = useState("");
   const [formEnabled, setFormEnabled] = useState(false);
+  const [savedFlareSolverr, setSavedFlareSolverr] = useState("");
+  const [formFlareSolverr, setFormFlareSolverr] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
@@ -37,6 +39,8 @@ export function ProxySettingsCard() {
       setSettings(data.proxy);
       setFormUrl(data.proxy.url);
       setFormEnabled(data.proxy.enabled);
+      setSavedFlareSolverr(data.proxy.flaresolverr ?? "");
+      setFormFlareSolverr(data.proxy.flaresolverr ?? "");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "加载代理配置失败");
     } finally {
@@ -54,7 +58,8 @@ export function ProxySettingsCard() {
 
   const urlChanged = formUrl.trim() !== settings.url;
   const enabledChanged = formEnabled !== settings.enabled;
-  const dirty = urlChanged || enabledChanged;
+  const flareSolverrChanged = formFlareSolverr.trim() !== savedFlareSolverr;
+  const dirty = urlChanged || enabledChanged || flareSolverrChanged;
 
   const handleSave = async () => {
     if (formEnabled && !formUrl.trim()) {
@@ -63,13 +68,16 @@ export function ProxySettingsCard() {
     }
     setIsSaving(true);
     try {
-      const payload: { enabled?: boolean; url?: string } = {};
+      const payload: { enabled?: boolean; url?: string; flaresolverr?: string } = {};
       if (enabledChanged) payload.enabled = formEnabled;
       if (urlChanged) payload.url = formUrl.trim();
+      if (flareSolverrChanged) payload.flaresolverr = formFlareSolverr.trim();
       const data = await updateProxy(payload);
       setSettings(data.proxy);
       setFormUrl(data.proxy.url);
       setFormEnabled(data.proxy.enabled);
+      setSavedFlareSolverr(data.proxy.flaresolverr ?? "");
+      setFormFlareSolverr(data.proxy.flaresolverr ?? "");
       toast.success("代理配置已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存失败");
@@ -152,6 +160,22 @@ export function ProxySettingsCard() {
               />
               <div className="text-xs text-stone-400">
                 支持 <code className="font-mono">http / https / socks4 / socks5 / socks5h</code>。
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
+                <PlugZap className="size-3.5" />
+                FlareSolverr 地址
+              </label>
+              <Input
+                value={formFlareSolverr}
+                onChange={(event) => setFormFlareSolverr(event.target.value)}
+                placeholder="http://127.0.0.1:8191"
+                className="h-11 rounded-xl border-stone-200 bg-white font-mono text-xs"
+              />
+              <div className="text-xs text-stone-400">
+                用于刷新额度 / 请求 chatgpt.com 时按需绕过 Cloudflare 盾。留空则不启用；遇到 403 challenge 才会调用，拿到的出口 IP 应与上方代理一致。
               </div>
             </div>
 

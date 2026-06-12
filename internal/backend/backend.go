@@ -377,25 +377,57 @@ func (c *Client) bootstrapHeaders() map[string]string {
 	}
 }
 
+// cloudflareSolver is an optional capability of the account lookup: when present
+// (the real AccountService implements it), the bootstrap step can pass a Cloudflare
+// challenge via FlareSolverr by injecting a cf_clearance cookie into the client jar.
+type cloudflareSolver interface {
+	SolveCloudflare(ctx context.Context, client *http.Client, baseURL string) (string, bool)
+}
+
 func (c *Client) bootstrap(ctx context.Context) error {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/", nil)
-	for key, value := range c.bootstrapHeaders() {
-		req.Header.Set(key, value)
-	}
-	resp, err := c.httpClient.Do(req)
+	status, data, err := c.doBootstrap(ctx)
 	if err != nil {
 		return upstreamTransportError("bootstrap", err)
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return upstreamHTTPError("bootstrap", resp.StatusCode, data)
+	if status < 200 || status >= 300 {
+		// On a Cloudflare challenge, solve once via FlareSolverr (if the lookup
+		// supports it), then retry the bootstrap with the solved User-Agent.
+		if (status == 403 || status == 503) && isCloudflareChallengeBody(strings.ToLower(string(data))) {
+			if solver, ok := c.lookup.(cloudflareSolver); ok && solver != nil {
+				if solvedUA, solved := solver.SolveCloudflare(ctx, c.httpClient, c.BaseURL); solved {
+					if strings.TrimSpace(solvedUA) != "" {
+						c.userAgent = solvedUA
+					}
+					status, data, err = c.doBootstrap(ctx)
+					if err != nil {
+						return upstreamTransportError("bootstrap", err)
+					}
+				}
+			}
+		}
+		if status < 200 || status >= 300 {
+			return upstreamHTTPError("bootstrap", status, data)
+		}
 	}
 	c.powSources, c.powDataBuild = parsePOWResources(string(data))
 	if len(c.powSources) == 0 {
 		c.powSources = []string{defaultPOWScript}
 	}
 	return nil
+}
+
+func (c *Client) doBootstrap(ctx context.Context) (int, []byte, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/", nil)
+	for key, value := range c.bootstrapHeaders() {
+		req.Header.Set(key, value)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, nil
 }
 
 func (c *Client) getChatRequirements(ctx context.Context) (ChatRequirements, error) {

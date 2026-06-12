@@ -66,6 +66,7 @@ type AccountService struct {
 	busyTokenAliasRefs        map[string]int
 	remoteBaseURL             string
 	browserHTTPClient         func(profile string, timeout time.Duration) *http.Client
+	flareSolverr              func() string
 	textRequestCount          map[string]int
 	stickyTextToken           string
 	stickyImageToken          string
@@ -87,6 +88,12 @@ func NewAccountService(backend storage.Backend, config AccountConfig, proxy *Pro
 		}
 		return proxy.BrowserHTTPClientWithProfile(profile, timeout)
 	}
+	// Optional interface: if the config exposes a global FlareSolverr endpoint, use
+	// it to pass Cloudflare challenges encountered while refreshing accounts.
+	var flareSolverr func() string
+	if fs, ok := config.(interface{ FlareSolverr() string }); ok {
+		flareSolverr = fs.FlareSolverr
+	}
 	s := &AccountService{
 		storage:                   backend,
 		config:                    config,
@@ -100,6 +107,7 @@ func NewAccountService(backend storage.Backend, config AccountConfig, proxy *Pro
 		busyTokenAliasRefs:        map[string]int{},
 		remoteBaseURL:             "https://chatgpt.com",
 		browserHTTPClient:         browserHTTPClient,
+		flareSolverr:              flareSolverr,
 		textRequestCount:          map[string]int{},
 		random:                    rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
@@ -1432,10 +1440,17 @@ func (s *AccountService) newRemoteAccountClient(ctx context.Context, accessToken
 	if client == nil {
 		client = &http.Client{Timeout: timeout}
 	}
-	if err := s.bootstrapRemote(ctx, client, baseURL, accessToken); err != nil {
+	solvedUA, err := s.bootstrapRemote(ctx, client, baseURL, accessToken)
+	if err != nil {
 		return nil, err
 	}
-	return &remoteAccountClient{ctx: ctx, baseURL: baseURL, headers: s.remoteHeaders(accessToken), client: client}, nil
+	headers := s.remoteHeaders(accessToken)
+	if solvedUA != "" {
+		// cf_clearance is bound to the User-Agent that solved it; align subsequent
+		// requests so the injected clearance cookie stays valid.
+		headers["user-agent"] = solvedUA
+	}
+	return &remoteAccountClient{ctx: ctx, baseURL: baseURL, headers: headers, client: client}, nil
 }
 
 func (c *remoteAccountClient) doJSON(method, urlPath string, body any, extra map[string]string) (map[string]any, error) {
@@ -1523,21 +1538,80 @@ func (c *remoteAccountClient) deleteFiles(limit int) (map[string]any, error) {
 	return map[string]any{"files_seen": seen, "files_deleted": deleted}, nil
 }
 
-func (s *AccountService) bootstrapRemote(ctx context.Context, client *http.Client, baseURL, accessToken string) error {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/", nil)
-	for key, value := range s.remoteBootstrapHeaders(accessToken) {
-		req.Header.Set(key, value)
+func (s *AccountService) bootstrapRemote(ctx context.Context, client *http.Client, baseURL, accessToken string) (string, error) {
+	doBootstrap := func(userAgent string) (int, []byte, error) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/", nil)
+		for key, value := range s.remoteBootstrapHeaders(accessToken) {
+			req.Header.Set(key, value)
+		}
+		if userAgent != "" {
+			req.Header.Set("user-agent", userAgent)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, data, nil
 	}
-	resp, err := client.Do(req)
+
+	status, data, err := doBootstrap("")
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return refreshHTTPError("bootstrap", resp.StatusCode, data)
+	if status >= 200 && status < 300 {
+		return "", nil
 	}
-	return nil
+	// On a Cloudflare challenge, solve once via FlareSolverr (if configured), inject
+	// the cf_clearance cookie and retry the bootstrap with the solved User-Agent.
+	if (status == 403 || status == 503) && IsCloudflareChallengeText(string(data)) {
+		if solvedUA, ok := s.passCloudflareForClient(ctx, client, baseURL); ok {
+			status, data, err = doBootstrap(solvedUA)
+			if err != nil {
+				return "", err
+			}
+			if status >= 200 && status < 300 {
+				return solvedUA, nil
+			}
+		}
+	}
+	return "", refreshHTTPError("bootstrap", status, data)
+}
+
+// passCloudflareForClient solves the Cloudflare challenge for baseURL via the global
+// FlareSolverr endpoint and injects the resulting cookies into the client jar.
+// Returns the solved User-Agent and whether a solve succeeded.
+func (s *AccountService) passCloudflareForClient(ctx context.Context, client *http.Client, baseURL string) (string, bool) {
+	if s.flareSolverr == nil {
+		return "", false
+	}
+	endpoint := strings.TrimSpace(s.flareSolverr())
+	if endpoint == "" {
+		return "", false
+	}
+	proxy := ""
+	if s.proxy != nil && s.proxy.config != nil {
+		proxy = s.proxy.config.Proxy()
+	}
+	userAgent, cookies, err := SolveCloudflareChallenge(ctx, endpoint, baseURL+"/", proxy)
+	if err != nil {
+		return "", false
+	}
+	InjectCookies(client, baseURL+"/", cookies)
+	return userAgent, true
+}
+
+// SolveCloudflare exposes the FlareSolverr-backed challenge solver for other
+// packages (e.g. the chat backend client) to pass Cloudflare on chatgpt.com. It
+// injects the solved cookies into client and returns the solved User-Agent and
+// whether a solve succeeded. It is a no-op (returns false) when no FlareSolverr
+// endpoint is configured.
+func (s *AccountService) SolveCloudflare(ctx context.Context, client *http.Client, baseURL string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	return s.passCloudflareForClient(ctx, client, strings.TrimRight(baseURL, "/"))
 }
 
 func (s *AccountService) StartLimitedWatcher(ctx context.Context, interval time.Duration) {

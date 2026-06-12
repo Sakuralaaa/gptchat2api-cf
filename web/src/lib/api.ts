@@ -251,6 +251,7 @@ type AccountUpdateResponse = {
 
 export type SettingsConfig = {
   proxy: string;
+  flaresolverr?: string;
   base_url?: string;
   registration_enabled?: boolean;
   refresh_account_interval_minute?: number | string;
@@ -1711,6 +1712,7 @@ export async function fetchSub2APIImportJob(serverId: string) {
 export type ProxySettings = {
   enabled: boolean;
   url: string;
+  flaresolverr?: string;
 };
 
 export type ProxyTestResult = {
@@ -1724,7 +1726,7 @@ export async function fetchProxy() {
   return httpRequest<{ proxy: ProxySettings }>("/api/proxy");
 }
 
-export async function updateProxy(updates: { enabled?: boolean; url?: string }) {
+export async function updateProxy(updates: { enabled?: boolean; url?: string; flaresolverr?: string }) {
   return httpRequest<{ proxy: ProxySettings }>("/api/proxy", {
     method: "POST",
     body: updates,
