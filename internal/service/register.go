@@ -80,6 +80,7 @@ type registerWorker struct {
 	client    *http.Client
 	deviceID  string
 	userAgent string
+	cfCookies []*http.Cookie
 }
 
 type registerSentinelTokenGenerator struct {
@@ -320,6 +321,22 @@ func registerHTTPClient(proxy string, timeout time.Duration, deviceID string) (*
 	return client, nil
 }
 
+// newRegisterLoginClient clones a client for the independent login: it keeps the
+// source transport (so the proxy configuration is preserved, and tests keep their
+// injected transport) but uses a brand new cookie jar for session isolation.
+func newRegisterLoginClient(src *http.Client) (*http.Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Jar: jar}
+	if src != nil {
+		client.Transport = src.Transport
+		client.Timeout = src.Timeout
+	}
+	return client, nil
+}
+
 func (w *registerWorker) close() {
 	if w.client != nil {
 		w.client.CloseIdleConnections()
@@ -497,14 +514,32 @@ func (w *registerWorker) createAccount(ctx context.Context, name, birthdate stri
 
 func (w *registerWorker) loginAndExchangeTokens(ctx context.Context, email, password string, mailbox map[string]any) (map[string]any, error) {
 	w.step("开始独立登录换 token")
+	// Use an isolated cookie jar and a fresh device id for the independent login.
+	// Reusing the main registration session leaves stale auth cookies that trigger
+	// invalid_state 409 on authorize/continue. The transport (and thus proxy) is
+	// shared with the main client, and the freshly solved cf_clearance cookie and
+	// User-Agent are reused so the new session still passes Cloudflare.
+	loginClient, err := newRegisterLoginClient(w.client)
+	if err != nil {
+		return nil, err
+	}
+	defer loginClient.CloseIdleConnections()
+	loginDeviceID := util.NewUUID()
+	w.injectCloudflareCookies(loginClient, w.cfCookies)
+	w.seedLoginDeviceCookies(loginClient, loginDeviceID)
+
+	prevClient, prevDevice := w.client, w.deviceID
+	w.client, w.deviceID = loginClient, loginDeviceID
+	defer func() { w.client, w.deviceID = prevClient, prevDevice }()
+
 	codeVerifier, codeChallenge := generateRegisterPKCE()
-	values := registerAuthorizeParams(email, w.deviceID, registerRandomToken(), registerRandomToken(), codeChallenge)
+	values := registerAuthorizeParams(email, loginDeviceID, registerRandomToken(), registerRandomToken(), codeChallenge)
 	authorizeLogin := func() error {
 		status, _, err := w.request(ctx, http.MethodGet, registerAuthBase+"/api/accounts/authorize?"+values.Encode(), nil, w.navigateHeaders(registerPlatformBase+"/"), true)
 		if err != nil {
 			return err
 		}
-		if status != http.StatusOK {
+		if status != http.StatusOK && status != http.StatusFound {
 			return fmt.Errorf("platform_login_authorize_http_%d", status)
 		}
 		return nil
@@ -514,18 +549,24 @@ func (w *registerWorker) loginAndExchangeTokens(ctx context.Context, email, pass
 	}
 	w.step("登录 authorize 完成")
 
-	status, payload, err := w.submitLoginEmail(ctx, email)
-	if err != nil {
-		return nil, err
-	}
-	if status == http.StatusConflict {
-		w.step("邮箱提交 invalid_state，重新 authorize 后重试")
-		if err := authorizeLogin(); err != nil {
-			return nil, err
+	// Submit email with up to 3 attempts; on 409 invalid_state, clear auth cookies
+	// and re-authorize before retrying.
+	var status int
+	var payload map[string]any
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			w.step(fmt.Sprintf("邮箱提交 invalid_state，清理 cookie 后重新 authorize 重试(%d/3)", attempt+1))
+			w.clearLoginAuthCookies(loginClient, loginDeviceID)
+			if err := authorizeLogin(); err != nil {
+				return nil, err
+			}
 		}
 		status, payload, err = w.submitLoginEmail(ctx, email)
 		if err != nil {
 			return nil, err
+		}
+		if status != http.StatusConflict {
+			break
 		}
 	}
 	if status != http.StatusOK {
@@ -533,17 +574,38 @@ func (w *registerWorker) loginAndExchangeTokens(ctx context.Context, email, pass
 	}
 	w.step("邮箱提交完成")
 
-	headers := w.jsonHeaders(registerAuthBase + "/log-in/password")
-	token, err := w.buildSentinelToken(ctx, "password_verify")
-	if err != nil {
-		return nil, err
+	// Verify password with up to 3 attempts; on 409, re-authorize and resubmit
+	// email before retrying the password verification.
+	verifyPassword := func() (int, map[string]any, error) {
+		headers := w.jsonHeaders(registerAuthBase + "/log-in/password")
+		token, tokenErr := w.buildSentinelToken(ctx, "password_verify")
+		if tokenErr != nil {
+			return 0, nil, tokenErr
+		}
+		headers["openai-sentinel-token"] = token
+		return w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/password/verify", map[string]any{
+			"password": password,
+		}, headers, false)
 	}
-	headers["openai-sentinel-token"] = token
-	status, payload, err = w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/password/verify", map[string]any{
-		"password": password,
-	}, headers, false)
-	if err != nil {
-		return nil, err
+	w.step("开始密码校验")
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			w.step(fmt.Sprintf("密码校验 409，重新登录状态后重试(%d/3)", attempt+1))
+			w.clearLoginAuthCookies(loginClient, loginDeviceID)
+			if err := authorizeLogin(); err != nil {
+				return nil, err
+			}
+			if _, _, emailErr := w.submitLoginEmail(ctx, email); emailErr != nil {
+				return nil, emailErr
+			}
+		}
+		status, payload, err = verifyPassword()
+		if err != nil {
+			return nil, err
+		}
+		if status != http.StatusConflict {
+			break
+		}
 	}
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("password_verify_http_%d", status)
@@ -805,7 +867,8 @@ func (w *registerWorker) prewarmCloudflare(ctx context.Context) error {
 	if strings.TrimSpace(userAgent) != "" {
 		w.userAgent = userAgent
 	}
-	injected := w.injectCloudflareCookies(cookies)
+	w.cfCookies = cookies
+	injected := w.injectCloudflareCookies(w.client, cookies)
 	w.step(fmt.Sprintf("FlareSolverr 预热完成，注入 %d 个 cookie", injected))
 	return nil
 }
@@ -878,16 +941,48 @@ func (w *registerWorker) solveCloudflareChallenge(ctx context.Context, endpoint,
 	return payload.Solution.UserAgent, cookies, nil
 }
 
-func (w *registerWorker) injectCloudflareCookies(cookies []*http.Cookie) int {
-	if w.client == nil || w.client.Jar == nil || len(cookies) == 0 {
+func (w *registerWorker) injectCloudflareCookies(client *http.Client, cookies []*http.Cookie) int {
+	if client == nil || client.Jar == nil || len(cookies) == 0 {
 		return 0
 	}
 	authURL, err := url.Parse(registerAuthBase)
 	if err != nil {
 		return 0
 	}
-	w.client.Jar.SetCookies(authURL, cookies)
+	client.Jar.SetCookies(authURL, cookies)
 	return len(cookies)
+}
+
+// seedLoginDeviceCookies sets the oai-did device cookie on the login client so the
+// authorize flow is tied to the independent login device id.
+func (w *registerWorker) seedLoginDeviceCookies(client *http.Client, deviceID string) {
+	if client == nil || client.Jar == nil {
+		return
+	}
+	authURL, err := url.Parse(registerAuthBase)
+	if err != nil {
+		return
+	}
+	client.Jar.SetCookies(authURL, []*http.Cookie{
+		{Name: "oai-did", Value: deviceID, Domain: ".auth.openai.com", Path: "/"},
+		{Name: "oai-did", Value: deviceID, Domain: "auth.openai.com", Path: "/"},
+	})
+}
+
+// clearLoginAuthCookies drops all auth.openai.com cookies by swapping in a fresh
+// cookie jar, then re-seeds the device id and the solved cf_clearance so a new
+// authorize attempt starts from a clean state without re-triggering Cloudflare.
+func (w *registerWorker) clearLoginAuthCookies(client *http.Client, deviceID string) {
+	if client == nil {
+		return
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return
+	}
+	client.Jar = jar
+	w.injectCloudflareCookies(client, w.cfCookies)
+	w.seedLoginDeviceCookies(client, deviceID)
 }
 
 func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (string, error) {
