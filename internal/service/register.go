@@ -28,6 +28,9 @@ const (
 	registerModeQuota     = "quota"
 	registerModeAvailable = "available"
 
+	registerScreenHintSignup        = "signup"
+	registerScreenHintLoginOrSignup = "login_or_signup"
+
 	registerAuthBase                 = "https://auth.openai.com"
 	registerPlatformBase             = "https://platform.openai.com"
 	registerPlatformOAuthClientID    = "app_2SKx67EdpoN0G6j64rFvigXD"
@@ -423,7 +426,7 @@ func registerFailedToCreateAccount(payload map[string]any) bool {
 
 func (w *registerWorker) platformAuthorize(ctx context.Context, email string) error {
 	w.step("开始 platform authorize")
-	values := registerAuthorizeParams(email, w.deviceID, registerRandomToken(), registerRandomToken(), registerPKCEChallenge())
+	values := registerAuthorizeParamsWithScreenHint(email, w.deviceID, registerRandomToken(), registerRandomToken(), registerPKCEChallenge(), registerScreenHintSignup)
 	status, payload, err := w.request(ctx, http.MethodGet, registerAuthBase+"/api/accounts/authorize?"+values.Encode(), nil, w.navigateHeaders(registerPlatformBase+"/"), true)
 	if err != nil {
 		return err
@@ -475,8 +478,14 @@ func (w *registerWorker) sendOTP(ctx context.Context) error {
 
 func (w *registerWorker) validateOTP(ctx context.Context, code string) error {
 	w.step("开始校验验证码 " + code)
-	if _, err := w.validateOTPCode(ctx, code); err != nil {
+	payload, err := w.validateOTPCode(ctx, code)
+	if err != nil {
 		return err
+	}
+	if continueURL := extractRegisterContinueURL(payload); continueURL != "" {
+		if err := w.authorizeContinue(ctx, continueURL); err != nil {
+			return err
+		}
 	}
 	w.step("验证码校验完成")
 	return nil
@@ -485,11 +494,14 @@ func (w *registerWorker) validateOTP(ctx context.Context, code string) error {
 func (w *registerWorker) createAccount(ctx context.Context, name, birthdate string) error {
 	w.step("开始创建账号资料")
 	headers := w.jsonHeaders(registerAuthBase + "/about-you")
-	token, err := w.buildSentinelToken(ctx, "oauth_create_account")
+	artifacts, err := w.buildSentinelArtifacts(ctx, "oauth_create_account")
 	if err != nil {
 		return err
 	}
-	headers["openai-sentinel-token"] = token
+	headers["openai-sentinel-token"] = artifacts.token
+	if artifacts.soToken != "" {
+		headers["openai-sentinel-so-token"] = artifacts.soToken
+	}
 	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/create_account", map[string]any{
 		"name":      name,
 		"birthdate": birthdate,
@@ -504,6 +516,26 @@ func (w *registerWorker) createAccount(ctx context.Context, name, birthdate stri
 		return fmt.Errorf("create_account_http_%d%s", status, registerResponseDetail(payload))
 	}
 	w.step("创建账号资料完成")
+	return nil
+}
+
+func (w *registerWorker) authorizeContinue(ctx context.Context, continueURL string) error {
+	target := strings.TrimSpace(continueURL)
+	if target == "" {
+		return nil
+	}
+	if strings.HasPrefix(target, "/") {
+		target = registerAuthBase + target
+	}
+	w.step("开始执行 authorize/continue")
+	status, _, err := w.request(ctx, http.MethodGet, target, nil, w.navigateHeaders(registerAuthBase+"/email-verification"), true)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK && status != http.StatusFound {
+		return fmt.Errorf("authorize_continue_http_%d", status)
+	}
+	w.step("authorize/continue 完成")
 	return nil
 }
 
@@ -913,6 +945,19 @@ func (w *registerWorker) clearLoginAuthCookies(client *http.Client, deviceID str
 }
 
 func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (string, error) {
+	artifacts, err := w.buildSentinelArtifacts(ctx, flow)
+	if err != nil {
+		return "", err
+	}
+	return artifacts.token, nil
+}
+
+type registerSentinelArtifacts struct {
+	token   string
+	soToken string
+}
+
+func (w *registerWorker) buildSentinelArtifacts(ctx context.Context, flow string) (registerSentinelArtifacts, error) {
 	generator := newRegisterSentinelTokenGenerator(w.deviceID, w.ua())
 	reqPayload := map[string]any{
 		"p":    generator.generateRequirementsToken(),
@@ -921,16 +966,16 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (s
 	}
 	body, err := registerCompactJSONBytes(reqPayload)
 	if err != nil {
-		return "", err
+		return registerSentinelArtifacts{}, err
 	}
 	headers := registerSentinelHeaders(w.ua())
 	status, payload, err := w.requestRawJSON(ctx, http.MethodPost, registerSentinelBase+"/backend-api/sentinel/req", body, headers)
 	if err != nil {
-		return "", err
+		return registerSentinelArtifacts{}, err
 	}
 	challengeToken := util.Clean(payload["token"])
 	if status != http.StatusOK || challengeToken == "" {
-		return "", fmt.Errorf("sentinel_req_failed_%d", status)
+		return registerSentinelArtifacts{}, fmt.Errorf("sentinel_req_failed_%d", status)
 	}
 	proof := util.StringMap(payload["proofofwork"])
 	var pValue string
@@ -948,9 +993,12 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (s
 	}
 	data, err := registerCompactJSONBytes(tokenPayload)
 	if err != nil {
-		return "", err
+		return registerSentinelArtifacts{}, err
 	}
-	return string(data), nil
+	return registerSentinelArtifacts{
+		token:   string(data),
+		soToken: registerSentinelSOToken(payload, generator),
+	}, nil
 }
 
 func (w *registerWorker) requestRawJSON(ctx context.Context, method, target string, body []byte, headers map[string]string) (int, map[string]any, error) {
@@ -1455,13 +1503,20 @@ func generateRegisterPKCE() (string, string) {
 }
 
 func registerAuthorizeParams(email, deviceID, state, nonce, codeChallenge string) url.Values {
+	return registerAuthorizeParamsWithScreenHint(email, deviceID, state, nonce, codeChallenge, registerScreenHintLoginOrSignup)
+}
+
+func registerAuthorizeParamsWithScreenHint(email, deviceID, state, nonce, codeChallenge, screenHint string) url.Values {
 	values := url.Values{}
+	if strings.TrimSpace(screenHint) == "" {
+		screenHint = registerScreenHintLoginOrSignup
+	}
 	values.Set("issuer", registerAuthBase)
 	values.Set("client_id", registerPlatformOAuthClientID)
 	values.Set("audience", registerPlatformOAuthAudience)
 	values.Set("redirect_uri", registerPlatformOAuthRedirectURI)
 	values.Set("device_id", deviceID)
-	values.Set("screen_hint", "login_or_signup")
+	values.Set("screen_hint", screenHint)
 	values.Set("max_age", "0")
 	values.Set("login_hint", email)
 	values.Set("scope", "openid profile email offline_access")
@@ -1473,6 +1528,24 @@ func registerAuthorizeParams(email, deviceID, state, nonce, codeChallenge string
 	values.Set("code_challenge_method", "S256")
 	values.Set("auth0Client", registerPlatformAuth0Client)
 	return values
+}
+
+func extractRegisterContinueURL(payload map[string]any) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	if direct := util.Clean(payload["continue_url"]); direct != "" {
+		return direct
+	}
+	if direct := util.Clean(payload["continueUrl"]); direct != "" {
+		return direct
+	}
+	page := util.StringMap(payload["page"])
+	if nested := extractRegisterContinueURL(util.StringMap(page["payload"])); nested != "" {
+		return nested
+	}
+	session := util.StringMap(payload["oai-client-auth-session"])
+	return firstNonEmpty(util.Clean(session["continue_url"]), util.Clean(session["continueUrl"]))
 }
 
 func registerOAuthCode(target string) string {
@@ -1586,6 +1659,32 @@ func registerFNV1A32(text string) string {
 	hash *= 3266489909
 	hash ^= hash >> 16
 	return fmt.Sprintf("%08x", hash)
+}
+
+func registerSentinelSOToken(payload map[string]any, generator *registerSentinelTokenGenerator) string {
+	if len(payload) == 0 || generator == nil {
+		return ""
+	}
+	if direct := firstNonEmpty(util.Clean(payload["so_token"]), util.Clean(payload["soToken"])); direct != "" {
+		return direct
+	}
+	requirements := util.StringMap(payload["requirements"])
+	if direct := firstNonEmpty(util.Clean(requirements["so_token"]), util.Clean(requirements["soToken"])); direct != "" {
+		return direct
+	}
+	for _, node := range []map[string]any{util.StringMap(payload["so"]), util.StringMap(payload["so_token"]), util.StringMap(requirements["so"]), util.StringMap(requirements["so_token"])} {
+		if direct := firstNonEmpty(util.Clean(node["token"]), util.Clean(node["value"]), util.Clean(node["result"])); direct != "" {
+			return direct
+		}
+		if util.ToBool(node["required"]) {
+			seed := util.Clean(node["seed"])
+			difficulty := util.Clean(node["difficulty"])
+			if seed != "" && difficulty != "" {
+				return generator.generateToken(seed, difficulty)
+			}
+		}
+	}
+	return ""
 }
 
 func registerSentinelHeaders(userAgent string) map[string]string {

@@ -73,6 +73,26 @@ func TestBuildSentinelTokenUsesSentinelChallenge(t *testing.T) {
 	}
 }
 
+func TestPlatformAuthorizeUsesSignupScreenHint(t *testing.T) {
+	worker := &registerWorker{
+		service:  &RegisterService{subscribers: map[chan string]struct{}{}},
+		deviceID: "device-1",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/api/accounts/authorize" {
+				t.Fatalf("unexpected request path: %s", req.URL.Path)
+			}
+			if got := req.URL.Query().Get("screen_hint"); got != registerScreenHintSignup {
+				t.Fatalf("screen_hint = %q, want %q", got, registerScreenHintSignup)
+			}
+			return registerJSONResponse(req, http.StatusOK, `{}`), nil
+		})},
+	}
+
+	if err := worker.platformAuthorize(context.Background(), "user@example.test"); err != nil {
+		t.Fatalf("platformAuthorize() error = %v", err)
+	}
+}
+
 func TestValidateOTPCodeRetriesWithSentinelToken(t *testing.T) {
 	validateCalls := 0
 	worker := &registerWorker{
@@ -109,6 +129,34 @@ func TestValidateOTPCodeRetriesWithSentinelToken(t *testing.T) {
 	}
 	if payload["continue_url"] != "/continue" {
 		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestValidateOTPFollowsContinueURL(t *testing.T) {
+	var sequence []string
+	worker := &registerWorker{
+		service:  &RegisterService{subscribers: map[chan string]struct{}{}},
+		deviceID: "device-1",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Path {
+			case "/api/accounts/email-otp/validate":
+				sequence = append(sequence, "validate")
+				return registerJSONResponse(req, http.StatusOK, `{"continue_url":"/authorize/continue"}`), nil
+			case "/authorize/continue":
+				sequence = append(sequence, "continue")
+				return registerJSONResponse(req, http.StatusOK, `{}`), nil
+			default:
+				t.Fatalf("unexpected request path: %s", req.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+
+	if err := worker.validateOTP(context.Background(), "123456"); err != nil {
+		t.Fatalf("validateOTP() error = %v", err)
+	}
+	if strings.Join(sequence, ",") != "validate,continue" {
+		t.Fatalf("sequence = %#v", sequence)
 	}
 }
 
@@ -157,6 +205,9 @@ func TestLoginAndExchangeTokensSubmitsEmailBeforePassword(t *testing.T) {
 			switch req.URL.Path {
 			case "/api/accounts/authorize":
 				sequence = append(sequence, "authorize")
+				if got := req.URL.Query().Get("screen_hint"); got != registerScreenHintLoginOrSignup {
+					t.Fatalf("login screen_hint = %q, want %q", got, registerScreenHintLoginOrSignup)
+				}
 				return registerJSONResponse(req, http.StatusOK, `{}`), nil
 			case "/backend-api/sentinel/req":
 				return registerJSONResponse(req, http.StatusOK, `{"token":"challenge-token","proofofwork":{"required":false}}`), nil
@@ -197,6 +248,34 @@ func TestLoginAndExchangeTokensSubmitsEmailBeforePassword(t *testing.T) {
 	want := []string{"authorize", "email", "password", "callback", "token"}
 	if strings.Join(sequence, ",") != strings.Join(want, ",") {
 		t.Fatalf("request sequence = %#v, want %#v", sequence, want)
+	}
+}
+
+func TestCreateAccountIncludesSOTokenWhenProvided(t *testing.T) {
+	worker := &registerWorker{
+		service:  &RegisterService{subscribers: map[chan string]struct{}{}},
+		deviceID: "device-1",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Path {
+			case "/backend-api/sentinel/req":
+				return registerJSONResponse(req, http.StatusOK, `{"token":"challenge-token","proofofwork":{"required":false},"so_token":"so-token"}`), nil
+			case "/api/accounts/create_account":
+				if req.Header.Get("openai-sentinel-token") == "" {
+					t.Fatal("create account request did not include sentinel token")
+				}
+				if got := req.Header.Get("openai-sentinel-so-token"); got != "so-token" {
+					t.Fatalf("openai-sentinel-so-token = %q", got)
+				}
+				return registerJSONResponse(req, http.StatusOK, `{}`), nil
+			default:
+				t.Fatalf("unexpected request path: %s", req.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+
+	if err := worker.createAccount(context.Background(), "Test User", "1990-01-01"); err != nil {
+		t.Fatalf("createAccount() error = %v", err)
 	}
 }
 
