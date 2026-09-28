@@ -508,4 +508,18 @@ func TestNewStoreDiscoversEnvFromParentDirectory(t *testing.T) {
 		t.Fatalf("BaseURL() = %q", store.BaseURL())
 	}
 }
-
+
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	original, existed := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("Unsetenv(%s): %v", key, err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(key, original)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	})
+}
