@@ -1255,6 +1255,14 @@ func clearAuthSessionCookie(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func isHTTPSRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
+	return proto == "https"
+}
+
 func (a *App) resolveImageBaseURL(r *http.Request) string {
 	if base := a.config.BaseURL(); base != "" {
 		return base
