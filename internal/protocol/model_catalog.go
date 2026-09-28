@@ -66,7 +66,7 @@ func (e *Engine) fetchLiveModels(ctx context.Context) []modelCatalogEntry {
 		}
 		entries = append(entries, modelCatalogEntry{
 			slug:     slug,
-			created:  util.ToInt(item["created"], 0),
+			created:  int64(util.ToInt(item["created"], 0)),
 			ownedBy:  util.Clean(item["owned_by"]),
 			fromLive: true,
 		})
