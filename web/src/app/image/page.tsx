@@ -74,6 +74,8 @@ import {
   supportsImageOutputCompression,
   supportsImageOutputControls,
   supportsStructuredImageParameters,
+  getDynamicModelOptions,
+  loadModelCatalog,
   usesOfficialImageRoute,
   updateManagedImageVisibility,
   type ImageModel,
@@ -141,7 +143,7 @@ type EditingTurnDraft = {
   conversationId: string;
   turnId: string;
   prompt: string;
-  model: ImageModel;
+  model: string;
   mode: ImageConversationMode;
   count: string;
   sizeMode: ImageSizeMode;
@@ -321,7 +323,7 @@ function isInvalidCustomRatioSelection(sizeMode: ImageSizeMode, aspectRatio: Ima
   return sizeMode === "ratio" && aspectRatio === CUSTOM_IMAGE_ASPECT_RATIO && !parseImageRatio(customRatio);
 }
 
-function effectiveImageSizeSelection(model: ImageModel, selection: ImageSizeSelection): ImageSizeSelection {
+function effectiveImageSizeSelection(model: string, selection: ImageSizeSelection): ImageSizeSelection {
   if (supportsStructuredImageParameters(model)) {
     return selection;
   }
@@ -338,7 +340,7 @@ function effectiveImageSizeSelection(model: ImageModel, selection: ImageSizeSele
   };
 }
 
-function buildEffectiveImageSizeRequest(model: ImageModel, selection: ImageSizeSelection) {
+function buildEffectiveImageSizeRequest(model: string, selection: ImageSizeSelection) {
   const effectiveSelection = effectiveImageSizeSelection(model, selection);
   return {
     selection: effectiveSelection,
@@ -346,11 +348,11 @@ function buildEffectiveImageSizeRequest(model: ImageModel, selection: ImageSizeS
   };
 }
 
-function imageOutputFormatForModel(model: ImageModel, format: ImageOutputFormat) {
+function imageOutputFormatForModel(model: string, format: ImageOutputFormat) {
   return supportsImageOutputControls(model) ? format : undefined;
 }
 
-function imageOutputCompressionForModel(model: ImageModel, format: ImageOutputFormat, value: unknown) {
+function imageOutputCompressionForModel(model: string, format: ImageOutputFormat, value: unknown) {
   if (!supportsImageOutputControls(model)) {
     return undefined;
   }
@@ -634,7 +636,7 @@ function sortImageConversations(conversations: ImageConversation[]) {
   return [...conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-function getStoredImageModel(): ImageModel {
+function getStoredImageModel(): string {
   if (typeof window === "undefined") {
     return DEFAULT_IMAGE_MODEL;
   }
@@ -1081,7 +1083,7 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
 
   const [imagePrompt, setImagePrompt] = useState("");
   const [composerMode, setComposerMode] = useState<ComposerMode>(getStoredComposerMode);
-  const [imageModel, setImageModel] = useState<ImageModel>(getStoredImageModel);
+  const [imageModel, setImageModel] = useState<string>(getStoredImageModel);
   const [imageCount, setImageCount] = useState("1");
   const [imageSizeMode, setImageSizeMode] = useState<ImageSizeMode>(() => getStoredImageSizeSelection().mode);
   const [imageAspectRatio, setImageAspectRatio] = useState<ImageAspectRatio>(() => getStoredImageSizeSelection().aspectRatio);
@@ -1202,7 +1204,7 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
   const editingDraftSizeIsHighResolution = Boolean(
     editingDraftStructuredParameters && editingDraftImageSize && isHighResolutionImageSize(editingDraftImageSize),
   );
-  const composerModelOptions = composerMode === "chat" ? CHAT_MODEL_OPTIONS : IMAGE_CREATION_MODEL_OPTIONS;
+  const composerModelOptions = getDynamicModelOptions();
   const selectedConversation = useMemo(
     () => conversations.find((item) => item.id === selectedConversationId) ?? null,
     [conversations, selectedConversationId],
@@ -1233,6 +1235,10 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
+
+  useEffect(() => {
+    void loadModelCatalog();
+  }, []);
 
   useEffect(() => {
     const node = composerDockRef.current;
@@ -1369,7 +1375,7 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
     setComposerMode("image");
     setImagePrompt(prompt);
     setImageCount("1");
-    setImageModel(isImageCreationModel(intent.model) ? intent.model : DEFAULT_IMAGE_MODEL);
+    setImageModel(isImageCreationModel(intent.model) && intent.model ? intent.model : DEFAULT_IMAGE_MODEL);
     setImageSizeMode(sizeSelection.mode);
     setImageAspectRatio(sizeSelection.aspectRatio);
     setImageResolution(isImageResolution(intent.resolutionPreset) ? intent.resolutionPreset : sizeSelection.resolution);
@@ -3052,7 +3058,7 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
                         value={editingTurnDraft.model}
                         onValueChange={(value) =>
                           setEditingTurnDraft((current) =>
-                            current && isImageModel(value) ? { ...current, model: value } : current,
+                            current ? { ...current, model: value } : current,
                           )
                         }
                       >

@@ -61,7 +61,7 @@ export type StoredImageSizeSelection = {
 export type ImageTurn = {
   id: string;
   prompt: string;
-  model: ImageModel;
+  model: string;
   mode: ImageConversationMode;
   referenceImages: StoredReferenceImage[];
   count: number;

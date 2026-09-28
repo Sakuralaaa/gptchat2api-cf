@@ -173,6 +173,16 @@ func (a *App) handleModels(w http.ResponseWriter, r *http.Request) {
 	a.writeProtocol(w, r, result, nil, err, "openai", "/v1/models", "models", identity, "模型列表", service.ImageVisibilityPrivate, service.BillingReference{})
 }
 
+// handleModelCatalog serves the merged live+local model list used by the web
+// console so newly released upstream models appear without a redeploy.
+func (a *App) handleModelCatalog(w http.ResponseWriter, r *http.Request) {
+	identity, ok := a.requireIdentity(w, r, "")
+	if !ok {
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, a.engine.BuildModelCatalog(r.Context()))
+}
+
 func (a *App) handleImageGenerations(w http.ResponseWriter, r *http.Request) {
 	identity, ok := a.requireIdentity(w, r, "")
 	if !ok {

@@ -34,6 +34,7 @@ func (a *App) Handler() http.Handler {
 func (a *App) routes() []appRoute {
 	return []appRoute{
 		exact(http.MethodGet, "/v1/models", a.handleModels),
+		exact(http.MethodGet, "/api/model-catalog", a.handleModelCatalog),
 		exact(http.MethodPost, "/v1/images/generations", a.handleImageGenerations),
 		exact(http.MethodPost, "/v1/images/edits", a.handleImageEdits),
 		exact(http.MethodPost, "/v1/chat/completions", a.handleChatCompletions),

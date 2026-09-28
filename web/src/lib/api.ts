@@ -39,13 +39,81 @@ const CHAT_MODEL_VALUES = new Set<ImageModel>([
 export const IMAGE_TASK_MODEL_OPTIONS = IMAGE_MODEL_OPTIONS.filter((option) => IMAGE_TASK_MODEL_VALUES.has(option.value));
 export const IMAGE_CREATION_MODEL_OPTIONS = IMAGE_TASK_MODEL_OPTIONS;
 export const CHAT_MODEL_OPTIONS = IMAGE_MODEL_OPTIONS.filter((option) => CHAT_MODEL_VALUES.has(option.value));
+// ---------------------------------------------------------------------------
+// Dynamic model catalog — merged live upstream + static fallbacks. Newly
+// released OpenAI models appear here automatically (5-minute TTL cache).
+// ---------------------------------------------------------------------------
+export interface ModelCatalogEntry {
+  id: string;
+  created: number;
+  owned_by: string;
+  source: { live: boolean; local: boolean };
+}
+export interface ModelCatalogResponse {
+  object: "model_catalog";
+  schema_version: 1;
+  generated_at: string;
+  fetched_at?: string | null;
+  source: "live" | "cache" | "local";
+  image_model_default: string;
+  data: ModelCatalogEntry[];
+}
+
+let modelCatalog: ModelCatalogResponse | null = null;
+let modelCatalogLoading: Promise<ModelCatalogResponse | null> | null = null;
+let modelCatalogLoadedAt = 0;
+const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
+
+export async function loadModelCatalog(force = false): Promise<ModelCatalogResponse | null> {
+  if (!force && modelCatalog && Date.now() - modelCatalogLoadedAt < MODEL_CATALOG_TTL_MS) {
+    return modelCatalog;
+  }
+  if (modelCatalogLoading) return modelCatalogLoading;
+  modelCatalogLoading = (async () => {
+    try {
+      const response = await httpRequest<ModelCatalogResponse>("/api/model-catalog", { method: "GET" });
+      if (response && response.object === "model_catalog" && Array.isArray(response.data)) {
+        modelCatalog = response;
+        modelCatalogLoadedAt = Date.now();
+      }
+      return modelCatalog;
+    } catch {
+      return modelCatalog;
+    } finally {
+      modelCatalogLoading = null;
+    }
+  })();
+  return modelCatalogLoading;
+}
+
+export function getDynamicModelOptions(): Array<{ value: string; label: string; live?: boolean; local?: boolean }> {
+  const options = new Map<string, { value: string; label: string; live?: boolean; local?: boolean }>();
+  if (modelCatalog) {
+    for (const entry of modelCatalog.data) {
+      options.set(entry.id, {
+        value: entry.id,
+        label: entry.source.live ? entry.id : entry.id,
+        live: entry.source.live,
+        local: entry.source.local,
+      });
+    }
+  }
+  for (const option of IMAGE_MODEL_OPTIONS) {
+    if (!options.has(option.value)) {
+      options.set(option.value, { value: option.value, label: option.label, local: true });
+    }
+  }
+  return Array.from(options.values());
+}
+
 export const IMAGE_MODEL_ROUTE_DETAILS: Partial<Record<
-  ImageModel,
+  string,
   {
     routeLabel: string;
     description: string;
     badge?: string;
   }
+>> = {
   auto: {
     routeLabel: "官方图片工具",
     description: "默认等价 gpt-image-2.5；比例只作为提示词构图偏好，实际像素由官方返回决定。",
@@ -64,35 +132,35 @@ export function isImageModel(value: unknown): value is ImageModel {
   return typeof value === "string" && IMAGE_MODEL_VALUES.has(value);
 }
 
-export function isImageTaskModel(value: unknown): value is ImageModel {
+export function isImageTaskModel(value: unknown): boolean {
   return isImageModel(value) && IMAGE_TASK_MODEL_VALUES.has(value);
 }
 
-export function isImageCreationModel(value: unknown): value is ImageModel {
+export function isImageCreationModel(value: unknown): boolean {
   return isImageTaskModel(value);
 }
 
-export function isChatModel(value: unknown): value is ImageModel {
+export function isChatModel(value: unknown): boolean {
   return isImageModel(value) && CHAT_MODEL_VALUES.has(value);
 }
 
-export function usesOfficialImageRoute(model: ImageModel) {
+export function usesOfficialImageRoute(model: string) {
   return model === "auto" || model === "gpt-image-2.5" || model === "gpt-image-2";
 }
 
-export function usesCodexImageRoute(model: ImageModel) {
+export function usesCodexImageRoute(model: string) {
   return model === CODEX_IMAGE_MODEL;
 }
 
-export function supportsStructuredImageParameters(model: ImageModel) {
+export function supportsStructuredImageParameters(model: string) {
   return usesCodexImageRoute(model);
 }
 
-export function supportsImageOutputControls(model: ImageModel) {
+export function supportsImageOutputControls(model: string) {
   return usesOfficialImageRoute(model) || usesCodexImageRoute(model);
 }
 
-export function supportsImageQuality(_model: ImageModel) {
+export function supportsImageQuality(_model: string) {
   return false;
 }
 
@@ -305,7 +373,7 @@ export type ManagedImage = {
   owner_name?: string;
   visibility: ImageVisibility;
   prompt?: string;
-  model?: ImageModel;
+  model?: string;
   quality?: ImageQuality;
   date: string;
   size: number;
@@ -459,7 +527,7 @@ export type CreationTask = {
   id: string;
   status: "queued" | "running" | "success" | "error" | "cancelled";
   mode: "generate" | "edit" | "chat";
-  model?: ImageModel;
+  model?: string;
   size?: string;
   quality?: ImageQuality;
   output_format?: ImageOutputFormat;
@@ -900,7 +968,7 @@ export async function updateAccount(
   });
 }
 
-export async function generateImage(prompt: string, model?: ImageModel, size?: string, quality?: ImageQuality) {
+export async function generateImage(prompt: string, model?: string, size?: string, quality?: ImageQuality) {
   return httpRequest<ImageResponse>(
     "/v1/images/generations",
     {
@@ -917,7 +985,7 @@ export async function generateImage(prompt: string, model?: ImageModel, size?: s
   );
 }
 
-export async function editImage(files: File | File[], prompt: string, model?: ImageModel, size?: string, quality?: ImageQuality) {
+export async function editImage(files: File | File[], prompt: string, model?: string, size?: string, quality?: ImageQuality) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
 
@@ -948,7 +1016,7 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
 export async function createImageGenerationTask(
   clientTaskId: string,
   prompt: string,
-  model?: ImageModel,
+  model?: string,
   size?: string,
   quality?: ImageQuality,
   count = 1,
@@ -994,7 +1062,7 @@ export async function createImageEditTask(
   clientTaskId: string,
   files: File | File[],
   prompt: string,
-  model?: ImageModel,
+  model?: string,
   size?: string,
   quality?: ImageQuality,
   count = 1,
@@ -1075,7 +1143,7 @@ export async function createImageEditTask(
 export async function createChatCompletionTask(
   clientTaskId: string,
   prompt: string,
-  model: ImageModel,
+  model: string,
   messages: CreationTaskMessage[],
   referenceImages?: { name: string; dataUrl: string }[],
 ) {
@@ -1106,7 +1174,7 @@ export async function createChatCompletionTask(
   });
 }
 
-export async function createChatCompletion(model: ImageModel, messages: CreationTaskMessage[]) {
+export async function createChatCompletion(model: string, messages: CreationTaskMessage[]) {
   return httpRequest<ChatCompletionResponse>("/v1/chat/completions", {
     method: "POST",
     body: {

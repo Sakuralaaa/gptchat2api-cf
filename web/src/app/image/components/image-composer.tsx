@@ -62,8 +62,8 @@ type ImageComposerProps = {
   composerMode: "chat" | "image";
   prompt: string;
   imageCount: string;
-  imageModel: ImageModel;
-  imageModelOptions: ReadonlyArray<{ value: ImageModel; label: string }>;
+  imageModel: string;
+  imageModelOptions: ReadonlyArray<{ value: string; label: string; live?: boolean; local?: boolean }>;
   imageSizeMode: ImageSizeMode;
   imageAspectRatio: ImageAspectRatio;
   imageResolution: ImageResolution;
@@ -82,7 +82,7 @@ type ImageComposerProps = {
   onComposerModeChange: (mode: "chat" | "image") => void;
   onPromptChange: (value: string) => void;
   onImageCountChange: (value: string) => void;
-  onImageModelChange: (value: ImageModel) => void;
+  onImageModelChange: (value: string) => void;
   onImageSizeModeChange: (value: ImageSizeMode) => void;
   onImageAspectRatioChange: (value: ImageAspectRatio) => void;
   onImageResolutionChange: (value: ImageResolution) => void;
@@ -334,7 +334,7 @@ export function ImageComposer({
     [referenceImages],
   );
   const imageModelLabel = imageModelOptions.find((option) => option.value === imageModel)?.label || imageModel;
-  const imageModelRoute = IMAGE_MODEL_ROUTE_DETAILS[imageModel];
+  const imageModelRoute = IMAGE_MODEL_ROUTE_DETAILS[imageModel as ImageModel];
   const imageAspectRatioLabel =
     imageAspectRatio === CUSTOM_IMAGE_ASPECT_RATIO
       ? imageCustomRatio.trim() || "自定义比例"
