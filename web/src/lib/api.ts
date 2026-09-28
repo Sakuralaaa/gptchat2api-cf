@@ -5,6 +5,7 @@ export type AccountType = "Free" | "Plus" | "ProLite" | "Pro" | "Team";
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用" | "刷新中" | "过期待刷新";
 export const IMAGE_MODEL_OPTIONS = [
   { value: "auto", label: "Auto" },
+  { value: "gpt-image-2.5", label: "gpt-image-2.5" },
   { value: "gpt-image-2", label: "gpt-image-2" },
   { value: "codex-gpt-image-2", label: "codex-gpt-image-2" },
   { value: "gpt-5-mini", label: "gpt-5-mini" },
@@ -15,13 +16,14 @@ export const IMAGE_MODEL_OPTIONS = [
   { value: "gpt-5-3", label: "gpt-5-3" },
   { value: "gpt-5.4", label: "gpt-5.4" },
   { value: "gpt-5.5", label: "gpt-5.5" },
+  { value: "gpt-5.6", label: "gpt-5.6" },
 ] as const;
 export type ImageModel = (typeof IMAGE_MODEL_OPTIONS)[number]["value"];
 export const DEFAULT_IMAGE_MODEL: ImageModel = "auto";
 export const DEFAULT_CHAT_MODEL: ImageModel = "auto";
 export const CODEX_IMAGE_MODEL: ImageModel = "codex-gpt-image-2";
 const IMAGE_MODEL_VALUES = new Set<string>(IMAGE_MODEL_OPTIONS.map((option) => option.value));
-const IMAGE_TASK_MODEL_VALUES = new Set<ImageModel>(["auto", "gpt-image-2", "codex-gpt-image-2"]);
+const IMAGE_TASK_MODEL_VALUES = new Set<ImageModel>(["auto", "gpt-image-2.5", "gpt-image-2", "codex-gpt-image-2"]);
 const CHAT_MODEL_VALUES = new Set<ImageModel>([
   "auto",
   "gpt-5-mini",
@@ -32,6 +34,7 @@ const CHAT_MODEL_VALUES = new Set<ImageModel>([
   "gpt-5-3",
   "gpt-5.4",
   "gpt-5.5",
+  "gpt-5.6",
 ]);
 export const IMAGE_TASK_MODEL_OPTIONS = IMAGE_MODEL_OPTIONS.filter((option) => IMAGE_TASK_MODEL_VALUES.has(option.value));
 export const IMAGE_CREATION_MODEL_OPTIONS = IMAGE_TASK_MODEL_OPTIONS;
@@ -43,18 +46,17 @@ export const IMAGE_MODEL_ROUTE_DETAILS: Partial<Record<
     description: string;
     badge?: string;
   }
->> = {
   auto: {
     routeLabel: "官方图片工具",
-    description: "默认等价 gpt-image-2；比例只作为提示词构图偏好，实际像素由官方返回决定。",
+    description: "默认等价 gpt-image-2.5；比例只作为提示词构图偏好，实际像素由官方返回决定。",
+  },
+  "gpt-image-2.5": {
+    routeLabel: "官方图片工具",
+    description: "最新的 GPT Image 2.5 模型，走官方图片链路；画质与细节优于 image-2。",
   },
   "gpt-image-2": {
     routeLabel: "官方图片工具",
-    description: "走官方 f/conversation 图片链路；尺寸只作为构图偏好，格式由后端保存结果时处理。",
-  },
-  "codex-gpt-image-2": {
-    routeLabel: "Codex 链路",
-    description: "走 Codex Responses 图片接口；尺寸、格式和 JPEG 压缩率交给上游工具处理，需要 Plus / Team / Pro 账号。",
+    description: "上一代 GPT Image 2 模型，走官方图片链路；尺寸只作为构图偏好。",
   },
 };
 
@@ -75,7 +77,7 @@ export function isChatModel(value: unknown): value is ImageModel {
 }
 
 export function usesOfficialImageRoute(model: ImageModel) {
-  return model === "auto" || model === "gpt-image-2";
+  return model === "auto" || model === "gpt-image-2.5" || model === "gpt-image-2";
 }
 
 export function usesCodexImageRoute(model: ImageModel) {

@@ -3,7 +3,7 @@ package util
 import "testing"
 
 func TestImageGenerationModelSetExcludesTextModels(t *testing.T) {
-	for _, model := range []string{ImageModelAuto, ImageModelGPT, ImageModelCodex} {
+	for _, model := range []string{ImageModelAuto, ImageModelGPT, ImageModelGPT25, ImageModelCodex} {
 		if !IsImageGenerationModel(model) {
 			t.Fatalf("IsImageGenerationModel(%q) = false, want true", model)
 		}
@@ -39,6 +39,7 @@ func TestResponsesImageToolModelsIncludeTextModels(t *testing.T) {
 func TestModelListIncludesTextAndImageModels(t *testing.T) {
 	wantOrder := []string{
 		ImageModelGPT,
+		ImageModelGPT25,
 		ImageModelCodex,
 		ImageModelAuto,
 		ImageModelGPTMini,

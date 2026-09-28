@@ -17,27 +17,29 @@ import (
 )
 
 const (
-	ImageModelAuto      = "auto"
-	ImageModelGPT       = "gpt-image-2"
-	ImageModelCodex     = "codex-gpt-image-2"
-	ImageModelGPT5      = "gpt-5"
-	ImageModelGPT51     = "gpt-5-1"
-	ImageModelGPT52     = "gpt-5-2"
-	ImageModelGPT53     = "gpt-5-3"
-	ImageModelGPT53Mini = "gpt-5-3-mini"
-	ImageModelGPT54     = "gpt-5.4"
-	ImageModelGPT55     = "gpt-5.5"
-	ImageModelGPT56     = "gpt-5.6"
-	ImageModelGPTMini   = "gpt-5-mini"
+	ImageModelAuto       = "auto"
+	ImageModelGPT        = "gpt-image-2"
+	ImageModelGPT25      = "gpt-image-2.5"
+	ImageModelCodex      = "codex-gpt-image-2"
+	ImageModelGPT5       = "gpt-5"
+	ImageModelGPT51      = "gpt-5-1"
+	ImageModelGPT52      = "gpt-5-2"
+	ImageModelGPT53      = "gpt-5-3"
+	ImageModelGPT53Mini  = "gpt-5-3-mini"
+	ImageModelGPT54      = "gpt-5.4"
+	ImageModelGPT55      = "gpt-5.5"
+	ImageModelGPT56      = "gpt-5.6"
+	ImageModelGPTMini    = "gpt-5-mini"
 )
-
 var ImageModels = map[string]struct{}{
 	ImageModelGPT:   {},
+	ImageModelGPT25: {},
 	ImageModelCodex: {},
 }
 
 var ModelIDs = []string{
 	ImageModelGPT,
+	ImageModelGPT25,
 	ImageModelCodex,
 	ImageModelAuto,
 	ImageModelGPTMini,
@@ -53,6 +55,7 @@ var ModelIDs = []string{
 
 var ImageGenerationModelIDs = []string{
 	ImageModelGPT,
+	ImageModelGPT25,
 	ImageModelCodex,
 	ImageModelAuto,
 }
@@ -66,19 +69,21 @@ func init() {
 }
 
 var ResponsesImageToolModels = map[string]struct{}{
-	ImageModelAuto:      {},
-	ImageModelGPT:       {},
-	ImageModelCodex:     {},
-	ImageModelGPTMini:   {},
-	ImageModelGPT53Mini: {},
-	ImageModelGPT5:      {},
-	ImageModelGPT51:     {},
-	ImageModelGPT52:     {},
-	ImageModelGPT53:     {},
-	ImageModelGPT54:     {},
-	ImageModelGPT55:     {},
-	ImageModelGPT56:     {},
+	ImageModelAuto:       {},
+	ImageModelGPT:        {},
+	ImageModelGPT25:      {},
+	ImageModelCodex:      {},
+	ImageModelGPTMini:    {},
+	ImageModelGPT53Mini:  {},
+	ImageModelGPT5:       {},
+	ImageModelGPT51:      {},
+	ImageModelGPT52:      {},
+	ImageModelGPT53:      {},
+	ImageModelGPT54:      {},
+	ImageModelGPT55:      {},
+	ImageModelGPT56:      {},
 }
+
 
 func Clean(v any) string {
 	return strings.TrimSpace(fmt.Sprint(ValueOr(v, "")))

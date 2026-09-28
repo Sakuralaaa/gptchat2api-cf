@@ -182,7 +182,7 @@ func (r ConversationRequest) SupportsImageGenerationModel() bool {
 
 func (r ConversationRequest) UsesResponsesImageRoute() bool {
 	model := strings.TrimSpace(r.Model)
-	return model == "" || model == util.ImageModelAuto || model == util.ImageModelGPT || model == util.ImageModelCodex
+	return model == "" || model == util.ImageModelAuto || model == util.ImageModelGPT || model == util.ImageModelGPT25 || model == util.ImageModelCodex
 }
 
 type ConversationState struct {

@@ -1232,11 +1232,11 @@ func responseImageGenerationModel(model string) string {
 	model = strings.TrimSpace(model)
 	if util.IsImageGenerationModel(model) {
 		if model == util.ImageModelAuto {
-			return util.ImageModelGPT
+			return util.ImageModelGPT25
 		}
 		return model
 	}
-	return util.ImageModelGPT
+	return util.ImageModelGPT25
 }
 
 func (e *Engine) StreamTextResponse(ctx context.Context, body map[string]any) (<-chan map[string]any, <-chan error) {

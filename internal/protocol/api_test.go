@@ -1200,8 +1200,8 @@ func TestResponseImageGenerationRequestMapsTextModelToOfficialImageFlow(t *testi
 	if prompt != "生成封面" {
 		t.Fatalf("prompt = %q, want 生成封面", prompt)
 	}
-	if request.Model != "gpt-image-2" {
-		t.Fatalf("model = %q, want official gpt-image-2 image model", request.Model)
+	if request.Model != "gpt-image-2.5" {
+		t.Fatalf("model = %q, want official gpt-image-2.5 image model", request.Model)
 	}
 	if !request.SupportsImageGenerationModel() {
 		t.Fatal("request should support image generation")
