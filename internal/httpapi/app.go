@@ -176,7 +176,7 @@ func (a *App) handleModels(w http.ResponseWriter, r *http.Request) {
 // handleModelCatalog serves the merged live+local model list used by the web
 // console so newly released upstream models appear without a redeploy.
 func (a *App) handleModelCatalog(w http.ResponseWriter, r *http.Request) {
-	identity, ok := a.requireIdentity(w, r, "")
+	if _, ok := a.requireIdentity(w, r, ""); !ok {
 	if !ok {
 		return
 	}
