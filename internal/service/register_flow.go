@@ -851,17 +851,31 @@ func (f *registerFlow) waitForOTP(mailbox map[string]any, timeout time.Duration,
 	// waitRegisterCode polls the configured provider on its own interval; we
 	// wrap it with the OTP-level deadline so a stuck provider still yields to
 	// the flow's overall OTP timeout.
+	//
+	// If no code arrives past the halfway point, resend the OTP once mid-wait
+	// (delivery is often just slow on temp-mail workers) and keep waiting
+	// until the overall deadline instead of failing the whole registration.
 	deadline := time.Now().Add(timeout)
+	resendAt := time.Now().Add(timeout / 2)
+	resent := false
 	for {
 		code, err := waitRegisterCode(f.ctx, util.StringMap(f.w.config["mail"]), mailbox)
 		if err == nil && code != "" {
 			return code, nil
 		}
-		if time.Now().After(deadline) {
+		now := time.Now()
+		if now.After(deadline) {
 			if err != nil {
 				return "", err
 			}
 			return "", fmt.Errorf("等待注册验证码超时（%ds）", int(timeout.Seconds()))
+		}
+		if !resent && now.After(resendAt) {
+			resent = true
+			f.step("验证码等待过半未收到，自动补发 OTP 后继续等待")
+			if !f.kickoffOTPDelivery("otp_wait_resend") {
+				f.step("自动补发 OTP 失败，继续等待原邮件")
+			}
 		}
 		time.Sleep(2 * time.Second)
 	}
