@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+﻿# syntax=docker/dockerfile:1.7
 
 ARG VERSION=0.0.0-dev
 ARG GO_IMAGE=golang:1.26.2-bookworm
@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     git \
+    nodejs \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 

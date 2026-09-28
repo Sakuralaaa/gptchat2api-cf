@@ -79,6 +79,26 @@ type registerWorker struct {
 	deviceID  string
 	userAgent string
 	cfCookies []*http.Cookie
+	fp        registerFingerprint
+}
+
+type registerFingerprint struct {
+	secChUA               string
+	secChUAFullVersionList string
+	secChUAPlatformVersion string
+	screen                 string
+	impersonate            string
+}
+
+// newRegisterFingerprint returns a consistent Chrome/Windows client-hint set.
+func newRegisterFingerprint() registerFingerprint {
+	return registerFingerprint{
+		secChUA:                `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
+		secChUAFullVersionList: `"Chromium";v="146.0.0.0", "Not-A.Brand";v="24.0.0.0", "Google Chrome";v="146.0.0.0"`,
+		secChUAPlatformVersion: `"15.0.0"`,
+		screen:                 "1920x1080",
+		impersonate:            "chrome",
+	}
 }
 
 type registerSentinelTokenGenerator struct {
@@ -289,7 +309,18 @@ func newRegisterWorker(service *RegisterService, index int, config map[string]an
 		client:    client,
 		deviceID:  deviceID,
 		userAgent: registerUserAgent,
+		fp:        newRegisterFingerprint(),
 	}, nil
+}
+
+// flowUA reports the User-Agent shared by the flow headers. It honours a
+// FlareSolverr-solved UA (kept in userAgent by prewarmCloudflare) because
+// cf_clearance is bound to the UA that solved the challenge.
+func (w *registerWorker) flowUA() string {
+	if strings.TrimSpace(w.userAgent) != "" {
+		return w.userAgent
+	}
+	return registerUserAgent
 }
 
 func registerHTTPClient(proxy string, timeout time.Duration, deviceID string) (*http.Client, error) {
@@ -341,6 +372,9 @@ func (w *registerWorker) close() {
 	}
 }
 
+// run executes the ported gpt-auto-register flow. The legacy platform-authorize
+// first path (platformAuthorize → registerUser → sendOTP → …) was replaced
+// because it was broken in practice; see register_flow.go for the port notes.
 func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	if err := w.prewarmCloudflare(ctx); err != nil {
 		return nil, err
@@ -355,40 +389,20 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("mail provider did not return address")
 	}
 	w.step("邮箱创建完成: " + email)
-	password := registerRandomPassword(16)
-	firstName, lastName := registerRandomName()
-	if err := w.platformAuthorize(ctx, email); err != nil {
-		return nil, err
-	}
-	if err := w.registerUser(ctx, email, password); err != nil {
-		return nil, err
-	}
-	if err := w.sendOTP(ctx); err != nil {
-		return nil, err
-	}
-	w.step("开始等待注册验证码")
-	code, err := waitRegisterCode(ctx, w.mail, mailbox)
+
+	flow := newRegisterFlow(w, ctx)
+	flow.email = email
+	result, err := flow.run(mailbox)
 	if err != nil {
 		return nil, err
 	}
-	if code == "" {
-		return nil, fmt.Errorf("waiting for register verification code timed out")
-	}
-	w.step("收到注册验证码: " + code)
-	if err := w.validateOTP(ctx, code); err != nil {
-		return nil, err
-	}
-	if err := w.createAccount(ctx, firstName+" "+lastName, registerRandomBirthdate()); err != nil {
-		return nil, err
-	}
-	tokens, err := w.loginAndExchangeTokens(ctx, email, password, mailbox)
-	if err != nil {
-		return nil, err
-	}
-	tokens["email"] = email
-	tokens["password"] = password
-	tokens["created_at"] = util.NowISO()
-	return tokens, nil
+	return map[string]any{
+		"email":         result.Email,
+		"password":      result.Password,
+		"access_token":  result.AccessToken,
+		"session_token": result.SessionToken,
+		"created_at":    util.NowISO(),
+	}, nil
 }
 
 func registerAuthorizeErrorDetail(payload map[string]any) string {
@@ -1127,6 +1141,47 @@ func (w *registerWorker) requestForm(ctx context.Context, target string, form ur
 		defer resp.Body.Close()
 		payload := map[string]any{}
 		_ = util.DecodeJSON(resp.Body, &payload)
+		return resp.StatusCode, payload, nil
+	}
+	if lastErr != nil {
+		return 0, nil, lastErr
+	}
+	return 0, nil, fmt.Errorf("form request failed")
+}
+
+// requestFormWithHeaders posts a urlencoded form with fully caller-controlled
+// headers (used by the ported chatgpt.com NextAuth signin step, which requires
+// navigation-style headers on a form POST).
+func (w *registerWorker) requestFormWithHeaders(ctx context.Context, target string, form url.Values, headers map[string]string) (int, map[string]any, error) {
+	body := []byte(form.Encode())
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+		if err != nil {
+			return 0, nil, err
+		}
+		for key, value := range headers {
+			if strings.TrimSpace(value) != "" {
+				req.Header.Set(key, value)
+			}
+		}
+		resp, err := w.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < 2 {
+				time.Sleep(time.Second)
+				continue
+			}
+			return 0, nil, err
+		}
+		defer resp.Body.Close()
+		payload := map[string]any{}
+		defer resp.Body.Close()
+		payload := map[string]any{}
+		_ = util.DecodeJSON(resp.Body, &payload)
+		return resp.StatusCode, payload, nil
+	}
+		}
 		return resp.StatusCode, payload, nil
 	}
 	if lastErr != nil {
