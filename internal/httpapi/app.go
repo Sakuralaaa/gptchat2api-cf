@@ -127,8 +127,6 @@ func NewApp() (*App, error) {
 	logs.StartRetentionCleaner(ctx, cfg.LogRetentionDays, 24*time.Hour, logger)
 	return app, nil
 }
-	return app, nil
-}
 
 func (a *App) Close() {
 	if a.cancel != nil {
