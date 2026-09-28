@@ -40,6 +40,8 @@ func TestModelListIncludesTextAndImageModels(t *testing.T) {
 	wantOrder := []string{
 		ImageModelGPT,
 		ImageModelGPT25,
+		ImageModelGPT25Flare,
+		ImageModelGPT25Sunburst,
 		ImageModelCodex,
 		ImageModelAuto,
 		ImageModelGPTMini,

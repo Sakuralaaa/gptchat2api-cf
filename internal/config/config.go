@@ -387,6 +387,15 @@ func (s *Store) Update(data map[string]any) (map[string]any, error) {
 	for key, value := range data {
 		next[key] = value
 	}
+	if value, ok := next["login_page_image_mode"]; ok {
+		next["login_page_image_mode"] = normalizeLoginPageImageMode(value)
+	}
+	if value, ok := next["image_task_timeout_seconds"]; ok {
+		next["image_task_timeout_seconds"] = normalizeImageTaskTimeoutSeconds(value)
+	}
+	if value, ok := next["text_account_schedule_mode"]; ok {
+		next["text_account_schedule_mode"] = normalizeAccountScheduleMode(value)
+	}
 	if value, ok := next["image_account_schedule_mode"]; ok {
 		next["image_account_schedule_mode"] = normalizeAccountScheduleMode(value)
 	}
