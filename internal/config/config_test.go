@@ -1,10 +1,3 @@
-func assertConfigValue(t *testing.T, data map[string]any, key string, want any) {
-	t.Helper()
-	if got := data[key]; got != want {
-		t.Fatalf("%s = %#v, want %#v", key, got, want)
-	}
-}
-
 package config
 
 import (
@@ -13,6 +6,13 @@ import (
 	"strings"
 	"testing"
 )
+
+func assertConfigValue(t *testing.T, data map[string]any, key string, want any) {
+	t.Helper()
+	if got := data[key]; got != want {
+		t.Fatalf("%s = %#v, want %#v", key, got, want)
+	}
+}
 
 func TestStoreUpdatePersistsRuntimeSettings(t *testing.T) {
 	root := t.TempDir()
