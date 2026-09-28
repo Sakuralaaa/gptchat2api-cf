@@ -8,7 +8,6 @@ import {
   Send,
   KeyRound,
   LoaderCircle,
-  LogIn,
   MoonStar,
   ShieldCheck,
   Sun,
@@ -17,7 +16,6 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { AnnouncementNotifications } from "@/components/announcement-banner";
 import { LoginPageImageStage } from "@/components/login-page-image-stage";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -48,7 +46,6 @@ export default function LoginPage() {
   const [displayName, setDisplayName] = useState("");
   const [isRegisterMode, setIsRegisterMode] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [linuxDoEnabled, setLinuxDoEnabled] = useState(false);
   const [registrationEnabled, setRegistrationEnabled] = useState(false);
   const [theme, setTheme] = useState<ColorTheme>(() => getPreferredColorTheme());
   const { isCheckingAuth } = useRedirectIfAuthenticated();
@@ -59,12 +56,10 @@ export default function LoginPage() {
       try {
         const providers = await fetchAuthProviders();
         if (active) {
-          setLinuxDoEnabled(Boolean(providers.linuxdo?.enabled));
           setRegistrationEnabled(Boolean(providers.registration?.enabled));
         }
       } catch {
         if (active) {
-          setLinuxDoEnabled(false);
           setRegistrationEnabled(false);
         }
       }
@@ -106,13 +101,6 @@ export default function LoginPage() {
     } finally {
       setIsSubmitting(false);
     }
-  };
-
-  const handleLinuxDoLogin = () => {
-    const params = new URLSearchParams(typeof window !== "undefined" ? window.location.search : "");
-    const redirectTo = params.get("redirect") || "/image";
-    const base = webConfig.apiUrl.replace(/\/$/, "");
-    window.location.href = `${base}/auth/linuxdo/start?redirect=${encodeURIComponent(redirectTo)}`;
   };
 
   const handleThemeToggle = () => {
@@ -165,7 +153,6 @@ export default function LoginPage() {
             <span className="hidden sm:inline">GitHub</span>
           </a>
         </Button>
-        <AnnouncementNotifications target="login" className="size-9" />
         <Button
           ref={themeToggleRef}
           type="button"
@@ -316,22 +303,6 @@ export default function LoginPage() {
                   >
                     <span className="transition-opacity duration-150">
                       {isRegisterMode ? "已有账号，返回登录" : "没有账号，注册一个"}
-                    </span>
-                  </Button>
-                ) : null}
-                {linuxDoEnabled ? (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="relative mx-auto h-12 w-[88%] overflow-hidden rounded-[1.45rem] border-slate-200/95 bg-white/60 text-[#18181b] shadow-[0_10px_24px_rgba(148,163,184,0.14)] backdrop-blur-md transition-all duration-200 hover:-translate-y-0.5 hover:border-slate-300 hover:bg-white/84 hover:text-[#18181b] hover:shadow-[0_14px_30px_rgba(148,163,184,0.18)] focus-visible:ring-slate-300/55 disabled:opacity-50 disabled:hover:translate-y-0 dark:border-white/12 dark:bg-white/8 dark:text-white/88 dark:shadow-[0_12px_28px_rgba(2,6,23,0.26)] dark:hover:border-white/20 dark:hover:bg-white/13 dark:hover:text-white"
-                    onClick={handleLinuxDoLogin}
-                    disabled={isSubmitting}
-                  >
-                    <span className="pointer-events-none absolute inset-x-4 top-1 h-3 rounded-full bg-white/70 blur-sm dark:bg-white/12" />
-                    <span className="pointer-events-none absolute inset-[1px] rounded-[1.35rem] border border-white/50 dark:border-white/10" />
-                    <span className="relative z-10 flex items-center gap-2 font-semibold tracking-[-0.01em]">
-                      <LogIn className="size-4" />
-                      使用 Linuxdo 登录
                     </span>
                   </Button>
                 ) : null}

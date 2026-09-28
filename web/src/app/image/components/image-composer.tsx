@@ -46,6 +46,8 @@ import {
   type ImageSizeMode,
 } from "@/app/image/image-options";
 import {
+  CHAT_MODEL_OPTIONS,
+  IMAGE_CREATION_MODEL_OPTIONS,
   IMAGE_MODEL_ROUTE_DETAILS,
   IMAGE_OUTPUT_FORMAT_OPTIONS,
   supportsImageOutputControls,
@@ -63,7 +65,6 @@ type ImageComposerProps = {
   prompt: string;
   imageCount: string;
   imageModel: string;
-  imageModelOptions: ReadonlyArray<{ value: string; label: string; live?: boolean; local?: boolean }>;
   imageSizeMode: ImageSizeMode;
   imageAspectRatio: ImageAspectRatio;
   imageResolution: ImageResolution;
@@ -282,7 +283,6 @@ export function ImageComposer({
   prompt,
   imageCount,
   imageModel,
-  imageModelOptions,
   imageSizeMode,
   imageAspectRatio,
   imageResolution,
@@ -333,7 +333,8 @@ export function ImageComposer({
     () => referenceImages.map((image, index) => ({ id: `${image.name}-${index}`, src: image.dataUrl })),
     [referenceImages],
   );
-  const imageModelLabel = imageModelOptions.find((option) => option.value === imageModel)?.label || imageModel;
+  const modeModelOptions = composerMode === "chat" ? CHAT_MODEL_OPTIONS : IMAGE_CREATION_MODEL_OPTIONS;
+  const imageModelLabel = modeModelOptions.find((option) => option.value === imageModel)?.label || imageModel;
   const imageModelRoute = IMAGE_MODEL_ROUTE_DETAILS[imageModel as ImageModel];
   const imageAspectRatioLabel =
     imageAspectRatio === CUSTOM_IMAGE_ASPECT_RATIO
@@ -786,7 +787,7 @@ export function ImageComposer({
                   </button>
                   {isModelMenuOpen ? (
                     <div className="absolute bottom-[calc(100%+0.5rem)] left-0 z-[80] max-h-[45dvh] w-[min(14rem,calc(100vw-2rem))] overflow-y-auto rounded-[20px] border border-[#e5e7eb] bg-white p-1.5 shadow-[0_24px_80px_-32px_rgba(15,23,42,0.35)] dark:border-border dark:bg-card dark:shadow-[0_24px_80px_-28px_rgba(0,0,0,0.72)] sm:bottom-[calc(100%+8px)] sm:w-[218px]">
-                      {imageModelOptions.map((option) => {
+                      {modeModelOptions.map((option) => {
                         const active = option.value === imageModel;
                         return (
                           <button

@@ -34,48 +34,9 @@ func (a *App) handleAdminSystem(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		info, _ := a.update.CheckUpdate(r.Context(), false)
 		util.WriteJSON(w, http.StatusOK, map[string]any{
-			"version":       version.Get(),
-			"version_info":  version.GetInfo(),
-			"update_status": info,
-		})
-	case base + "/check-updates":
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		info, err := a.update.CheckUpdate(r.Context(), r.URL.Query().Get("force") == "true")
-		if err != nil {
-			util.WriteError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		util.WriteJSON(w, http.StatusOK, info)
-	case base + "/update":
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if err := a.update.PerformUpdate(r.Context()); err != nil {
-			util.WriteError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		util.WriteJSON(w, http.StatusOK, map[string]any{
-			"message":      "Update completed. Please restart the service.",
-			"need_restart": true,
-		})
-	case base + "/rollback":
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if err := a.update.Rollback(); err != nil {
-			util.WriteError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		util.WriteJSON(w, http.StatusOK, map[string]any{
-			"message":      "Rollback completed. Please restart the service.",
-			"need_restart": true,
+			"version":      version.Get(),
+			"version_info": version.GetInfo(),
 		})
 	case base + "/restart":
 		if r.Method != http.MethodPost {

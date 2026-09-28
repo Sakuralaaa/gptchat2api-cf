@@ -6,36 +6,19 @@ export type AccountStatus = "正常" | "限流" | "异常" | "禁用" | "刷新�
 export const IMAGE_MODEL_OPTIONS = [
   { value: "auto", label: "Auto" },
   { value: "gpt-image-2.5", label: "gpt-image-2.5" },
+  { value: "gpt-image-2.5-flare", label: "gpt-image-2.5 快速" },
+  { value: "gpt-image-2.5-sunburst", label: "gpt-image-2.5 质量" },
   { value: "gpt-image-2", label: "gpt-image-2" },
   { value: "codex-gpt-image-2", label: "codex-gpt-image-2" },
-  { value: "gpt-5-mini", label: "gpt-5-mini" },
-  { value: "gpt-5-3-mini", label: "gpt-5-3-mini" },
-  { value: "gpt-5", label: "gpt-5" },
-  { value: "gpt-5-1", label: "gpt-5-1" },
-  { value: "gpt-5-2", label: "gpt-5-2" },
-  { value: "gpt-5-3", label: "gpt-5-3" },
-  { value: "gpt-5.4", label: "gpt-5.4" },
-  { value: "gpt-5.5", label: "gpt-5.5" },
   { value: "gpt-5.6", label: "gpt-5.6" },
+  { value: "gpt-5.5", label: "gpt-5.5" },
 ] as const;
 export type ImageModel = (typeof IMAGE_MODEL_OPTIONS)[number]["value"];
 export const DEFAULT_IMAGE_MODEL: ImageModel = "auto";
 export const DEFAULT_CHAT_MODEL: ImageModel = "auto";
 export const CODEX_IMAGE_MODEL: ImageModel = "codex-gpt-image-2";
-const IMAGE_MODEL_VALUES = new Set<string>(IMAGE_MODEL_OPTIONS.map((option) => option.value));
-const IMAGE_TASK_MODEL_VALUES = new Set<ImageModel>(["auto", "gpt-image-2.5", "gpt-image-2", "codex-gpt-image-2"]);
-const CHAT_MODEL_VALUES = new Set<ImageModel>([
-  "auto",
-  "gpt-5-mini",
-  "gpt-5-3-mini",
-  "gpt-5",
-  "gpt-5-1",
-  "gpt-5-2",
-  "gpt-5-3",
-  "gpt-5.4",
-  "gpt-5.5",
-  "gpt-5.6",
-]);
+const IMAGE_TASK_MODEL_VALUES = new Set<string>(["auto", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2", "codex-gpt-image-2"]);
+const CHAT_MODEL_VALUES = new Set<string>(["auto", "gpt-5.6", "gpt-5.5"]);
 export const IMAGE_TASK_MODEL_OPTIONS = IMAGE_MODEL_OPTIONS.filter((option) => IMAGE_TASK_MODEL_VALUES.has(option.value));
 export const IMAGE_CREATION_MODEL_OPTIONS = IMAGE_TASK_MODEL_OPTIONS;
 export const CHAT_MODEL_OPTIONS = IMAGE_MODEL_OPTIONS.filter((option) => CHAT_MODEL_VALUES.has(option.value));
@@ -86,24 +69,10 @@ export async function loadModelCatalog(force = false): Promise<ModelCatalogRespo
   return modelCatalogLoading;
 }
 
-export function getDynamicModelOptions(): Array<{ value: string; label: string; live?: boolean; local?: boolean }> {
-  const options = new Map<string, { value: string; label: string; live?: boolean; local?: boolean }>();
-  if (modelCatalog) {
-    for (const entry of modelCatalog.data) {
-      options.set(entry.id, {
-        value: entry.id,
-        label: entry.source.live ? entry.id : entry.id,
-        live: entry.source.live,
-        local: entry.source.local,
-      });
-    }
-  }
-  for (const option of IMAGE_MODEL_OPTIONS) {
-    if (!options.has(option.value)) {
-      options.set(option.value, { value: option.value, label: option.label, local: true });
-    }
-  }
-  return Array.from(options.values());
+export function getDynamicModelOptions(): Array<{ value: string; label: string }> {
+  // Static curated list only — the live upstream catalog contains many retired
+  // / duplicate slugs, so the composer no longer merges them in.
+  return IMAGE_MODEL_OPTIONS.map((option) => ({ value: option.value, label: option.label }));
 }
 
 export const IMAGE_MODEL_ROUTE_DETAILS: Partial<Record<
@@ -122,12 +91,21 @@ export const IMAGE_MODEL_ROUTE_DETAILS: Partial<Record<
     routeLabel: "官方图片工具",
     description: "最新的 GPT Image 2.5 模型，走官方图片链路；画质与细节优于 image-2。",
   },
+  "gpt-image-2.5-flare": {
+    routeLabel: "官方图片工具 · 快速",
+    description: "GPT Image 2.5 快速模式，生成速度更快，适合日常出图。",
+  },
+  "gpt-image-2.5-sunburst": {
+    routeLabel: "官方图片工具 · 质量",
+    description: "GPT Image 2.5 质量模式，细节与画质更优，耗时稍长。",
+  },
   "gpt-image-2": {
     routeLabel: "官方图片工具",
     description: "上一代 GPT Image 2 模型，走官方图片链路；尺寸只作为构图偏好。",
   },
 };
 
+const IMAGE_MODEL_VALUES = new Set<string>(IMAGE_MODEL_OPTIONS.map((option) => option.value));
 export function isImageModel(value: unknown): value is ImageModel {
   return typeof value === "string" && IMAGE_MODEL_VALUES.has(value);
 }
@@ -145,7 +123,7 @@ export function isChatModel(value: unknown): boolean {
 }
 
 export function usesOfficialImageRoute(model: string) {
-  return model === "auto" || model === "gpt-image-2.5" || model === "gpt-image-2";
+  return model === "auto" || model === "gpt-image-2.5" || model === "gpt-image-2.5-flare" || model === "gpt-image-2.5-sunburst" || model === "gpt-image-2";
 }
 
 export function usesCodexImageRoute(model: string) {

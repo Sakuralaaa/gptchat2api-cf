@@ -24,7 +24,6 @@ func TestStoreUpdatePersistsRuntimeSettings(t *testing.T) {
 	unsetEnv(t, "CHATGPT2API_AUTO_REMOVE_RATE_LIMITED_ACCOUNTS")
 	unsetEnv(t, "CHATGPT2API_REGISTRATION_ENABLED")
 	unsetEnv(t, "CHATGPT2API_LOG_LEVELS")
-	unsetLinuxDoEnv(t)
 
 	store, err := NewStore()
 	if err != nil {
@@ -94,7 +93,6 @@ func TestStoreNormalizesAccountScheduleModes(t *testing.T) {
 	t.Setenv("CHATGPT2API_ROOT", root)
 	unsetEnv(t, "CHATGPT2API_TEXT_ACCOUNT_SCHEDULE_MODE")
 	unsetEnv(t, "CHATGPT2API_IMAGE_ACCOUNT_SCHEDULE_MODE")
-	unsetLinuxDoEnv(t)
 
 	store, err := NewStore()
 	if err != nil {
@@ -142,7 +140,6 @@ func TestStoreNormalizesUnsupportedLoginPageImageMode(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CHATGPT2API_ROOT", root)
 	unsetEnv(t, "CHATGPT2API_LOGIN_PAGE_IMAGE_MODE")
-	unsetLinuxDoEnv(t)
 
 	store, err := NewStore()
 	if err != nil {
@@ -173,7 +170,6 @@ func TestStoreNormalizesImageTaskTimeoutSeconds(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CHATGPT2API_ROOT", root)
 	unsetEnv(t, "CHATGPT2API_IMAGE_TASK_TIMEOUT_SECONDS")
-	unsetLinuxDoEnv(t)
 
 	store, err := NewStore()
 	if err != nil {
@@ -205,94 +201,6 @@ func TestStoreNormalizesImageTaskTimeoutSeconds(t *testing.T) {
 	assertConfigValue(t, got, "image_task_timeout_seconds", 900)
 	if store.ImageTaskTimeoutSeconds() != 900 {
 		t.Fatalf("ImageTaskTimeoutSeconds() = %d, want 900", store.ImageTaskTimeoutSeconds())
-	}
-}
-
-func TestStoreUpdatePersistsLinuxDoSettingsWithoutLeakingSecret(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("CHATGPT2API_ROOT", root)
-	unsetLinuxDoEnv(t)
-
-	store, err := NewStore()
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-
-	got, err := store.Update(map[string]any{
-		"linuxdo_enabled":               true,
-		"linuxdo_client_id":             "client-id",
-		"linuxdo_client_secret":         "client-secret",
-		"linuxdo_redirect_url":          "https://example.test/auth/linuxdo/oauth/callback",
-		"linuxdo_frontend_redirect_url": "http://127.0.0.1:5173/auth/linuxdo/callback",
-	})
-	if err != nil {
-		t.Fatalf("Update() error = %v", err)
-	}
-
-	assertConfigValue(t, got, "linuxdo_enabled", true)
-	assertConfigValue(t, got, "linuxdo_client_id", "client-id")
-	assertConfigValue(t, got, "linuxdo_client_secret_configured", true)
-	assertConfigValue(t, got, "linuxdo_redirect_url", "https://example.test/auth/linuxdo/oauth/callback")
-	assertConfigValue(t, got, "linuxdo_frontend_redirect_url", "http://127.0.0.1:5173/auth/linuxdo/callback")
-	if _, ok := got["linuxdo_client_secret"]; ok {
-		t.Fatalf("Get() leaked linuxdo_client_secret: %#v", got)
-	}
-	if !store.LinuxDoOAuth().Ready() {
-		t.Fatalf("LinuxDoOAuth() should be ready: %#v", store.LinuxDoOAuth())
-	}
-
-	envData, err := os.ReadFile(filepath.Join(root, ".env"))
-	if err != nil {
-		t.Fatalf("read .env: %v", err)
-	}
-	envText := string(envData)
-	for _, want := range []string{
-		"CHATGPT2API_LINUXDO_ENABLED=true",
-		"CHATGPT2API_LINUXDO_CLIENT_ID=client-id",
-		"CHATGPT2API_LINUXDO_CLIENT_SECRET=client-secret",
-		"CHATGPT2API_LINUXDO_FRONTEND_REDIRECT_URL=http://127.0.0.1:5173/auth/linuxdo/callback",
-		"CHATGPT2API_LINUXDO_REDIRECT_URL=https://example.test/auth/linuxdo/oauth/callback",
-	} {
-		if !strings.Contains(envText, want) {
-			t.Fatalf(".env missing %q in:\n%s", want, envText)
-		}
-	}
-
-	got, err = store.Update(map[string]any{
-		"linuxdo_enabled":               true,
-		"linuxdo_client_id":             "client-id-next",
-		"linuxdo_client_secret":         "",
-		"linuxdo_redirect_url":          "https://example.test/auth/linuxdo/oauth/callback",
-		"linuxdo_frontend_redirect_url": "/auth/linuxdo/callback",
-	})
-	if err != nil {
-		t.Fatalf("Update() with blank secret error = %v", err)
-	}
-	assertConfigValue(t, got, "linuxdo_client_id", "client-id-next")
-	assertConfigValue(t, got, "linuxdo_client_secret_configured", true)
-	assertConfigValue(t, got, "linuxdo_frontend_redirect_url", "/auth/linuxdo/callback")
-	if store.LinuxDoOAuth().ClientSecret != "client-secret" {
-		t.Fatalf("blank secret update should preserve existing secret")
-	}
-}
-
-func TestStoreUpdateRejectsIncompleteLinuxDoSettings(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("CHATGPT2API_ROOT", root)
-	unsetLinuxDoEnv(t)
-
-	store, err := NewStore()
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-
-	_, err = store.Update(map[string]any{
-		"linuxdo_enabled":      true,
-		"linuxdo_client_id":    "client-id",
-		"linuxdo_redirect_url": "https://example.test/auth/linuxdo/oauth/callback",
-	})
-	if err == nil || !strings.Contains(err.Error(), "Client Secret") {
-		t.Fatalf("Update() error = %v, want missing secret", err)
 	}
 }
 
@@ -453,7 +361,6 @@ func TestStoreUpdateOverridesEnvOnlyRuntimeSetting(t *testing.T) {
 func TestStoreUpdateOverridesEnvOnlyRuntimeSettings(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CHATGPT2API_ROOT", root)
-	unsetLinuxDoEnv(t)
 	for key, value := range map[string]string{
 		"CHATGPT2API_BASE_URL":                          "https://old.example/root",
 		"CHATGPT2API_PROXY":                             "http://127.0.0.1:8080",
@@ -568,71 +475,6 @@ func TestStoreUpdateOverridesEnvOnlyRuntimeSettings(t *testing.T) {
 	}
 }
 
-func TestStoreUpdateOverridesLinuxDoEnvOnlyRuntimeSettings(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("CHATGPT2API_ROOT", root)
-	t.Setenv("CHATGPT2API_BASE_URL", "https://old.example")
-	t.Setenv("CHATGPT2API_LINUXDO_ENABLED", "true")
-	t.Setenv("CHATGPT2API_LINUXDO_CLIENT_ID", "old-client")
-	t.Setenv("CHATGPT2API_LINUXDO_CLIENT_SECRET", "old-secret")
-	t.Setenv("CHATGPT2API_LINUXDO_REDIRECT_URL", "https://old.example/auth/linuxdo/oauth/callback")
-	t.Setenv("CHATGPT2API_LINUXDO_FRONTEND_REDIRECT_URL", "/old/callback")
-	for _, key := range []string{
-		"CHATGPT2API_LINUXDO_AUTHORIZE_URL",
-		"CHATGPT2API_LINUXDO_TOKEN_URL",
-		"CHATGPT2API_LINUXDO_USERINFO_URL",
-		"CHATGPT2API_LINUXDO_SCOPES",
-		"CHATGPT2API_LINUXDO_TOKEN_AUTH_METHOD",
-		"CHATGPT2API_LINUXDO_USE_PKCE",
-		"CHATGPT2API_LINUXDO_USERINFO_EMAIL_PATH",
-		"CHATGPT2API_LINUXDO_USERINFO_ID_PATH",
-		"CHATGPT2API_LINUXDO_USERINFO_USERNAME_PATH",
-	} {
-		unsetEnv(t, key)
-	}
-
-	store, err := NewStore()
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	got, err := store.Update(map[string]any{
-		"base_url":                      "https://new.example",
-		"linuxdo_enabled":               false,
-		"linuxdo_client_id":             "new-client",
-		"linuxdo_client_secret":         "new-secret",
-		"linuxdo_redirect_url":          "https://new.example/auth/linuxdo/oauth/callback",
-		"linuxdo_frontend_redirect_url": "/auth/linuxdo/callback",
-	})
-	if err != nil {
-		t.Fatalf("Update() error = %v", err)
-	}
-	assertConfigValue(t, got, "linuxdo_enabled", false)
-	assertConfigValue(t, got, "linuxdo_client_id", "new-client")
-	assertConfigValue(t, got, "linuxdo_redirect_url", "https://new.example/auth/linuxdo/oauth/callback")
-	assertConfigValue(t, got, "linuxdo_frontend_redirect_url", "/auth/linuxdo/callback")
-	if got["linuxdo_client_secret_configured"] != true {
-		t.Fatalf("linuxdo_client_secret_configured = %#v, want true", got["linuxdo_client_secret_configured"])
-	}
-	linuxdo := store.LinuxDoOAuth()
-	if linuxdo.Enabled || linuxdo.ClientID != "new-client" || linuxdo.ClientSecret != "new-secret" ||
-		linuxdo.RedirectURL != "https://new.example/auth/linuxdo/oauth/callback" ||
-		linuxdo.FrontendRedirectURL != "/auth/linuxdo/callback" {
-		t.Fatalf("LinuxDoOAuth() = %#v", linuxdo)
-	}
-	for key, want := range map[string]string{
-		"CHATGPT2API_BASE_URL":                      "https://new.example",
-		"CHATGPT2API_LINUXDO_ENABLED":               "false",
-		"CHATGPT2API_LINUXDO_CLIENT_ID":             "new-client",
-		"CHATGPT2API_LINUXDO_CLIENT_SECRET":         "new-secret",
-		"CHATGPT2API_LINUXDO_REDIRECT_URL":          "https://new.example/auth/linuxdo/oauth/callback",
-		"CHATGPT2API_LINUXDO_FRONTEND_REDIRECT_URL": "/auth/linuxdo/callback",
-	} {
-		if gotEnv := os.Getenv(key); gotEnv != want {
-			t.Fatalf("%s = %q, want %q", key, gotEnv, want)
-		}
-	}
-}
-
 func TestNewStoreDiscoversEnvFromParentDirectory(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("CHATGPT2API_BASE_URL=https://parent.example\n"), 0o644); err != nil {
@@ -666,131 +508,4 @@ func TestNewStoreDiscoversEnvFromParentDirectory(t *testing.T) {
 		t.Fatalf("BaseURL() = %q", store.BaseURL())
 	}
 }
-
-func TestStoreReadsUpdateGitHubTokenFromEnvFile(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("CHATGPT2API_UPDATE_GITHUB_TOKEN=ghp_test_token\n"), 0o644); err != nil {
-		t.Fatalf("write .env: %v", err)
-	}
-	t.Setenv("CHATGPT2API_ROOT", root)
-	unsetEnv(t, "CHATGPT2API_UPDATE_GITHUB_TOKEN")
-
-	store, err := NewStore()
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	if got := store.UpdateGitHubToken(); got != "ghp_test_token" {
-		t.Fatalf("UpdateGitHubToken() = %q, want token from .env", got)
-	}
-	if _, ok := store.Get()["update_github_token"]; ok {
-		t.Fatal("Get() leaked update GitHub token")
-	}
-	if got := store.Get()["update_github_token_configured"]; got != true {
-		t.Fatalf("Get() update_github_token_configured = %#v, want true", got)
-	}
-}
-
-func TestStoreUpdatePersistsUpdateSettings(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("CHATGPT2API_ROOT", root)
-	unsetEnv(t, "CHATGPT2API_UPDATE_GITHUB_TOKEN")
-	unsetEnv(t, "CHATGPT2API_UPDATE_REPO")
-
-	store, err := NewStore()
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	got, err := store.Update(map[string]any{
-		"update_repo":         "owner/project",
-		"update_github_token": "github_pat_test",
-	})
-	if err != nil {
-		t.Fatalf("Update() error = %v", err)
-	}
-	if got["update_repo"] != "owner/project" {
-		t.Fatalf("Update() update_repo = %#v, want owner/project", got["update_repo"])
-	}
-	if got["update_github_token_configured"] != true {
-		t.Fatalf("Update() update_github_token_configured = %#v, want true", got["update_github_token_configured"])
-	}
-	if _, ok := got["update_github_token"]; ok {
-		t.Fatalf("Update() leaked update_github_token: %#v", got)
-	}
-	if store.UpdateRepo() != "owner/project" {
-		t.Fatalf("UpdateRepo() = %q, want owner/project", store.UpdateRepo())
-	}
-	if store.UpdateGitHubToken() != "github_pat_test" {
-		t.Fatalf("UpdateGitHubToken() = %q, want saved token", store.UpdateGitHubToken())
-	}
-	envData, err := os.ReadFile(filepath.Join(root, ".env"))
-	if err != nil {
-		t.Fatalf("read .env: %v", err)
-	}
-	envText := string(envData)
-	for _, want := range []string{
-		"CHATGPT2API_UPDATE_REPO=owner/project",
-		"CHATGPT2API_UPDATE_GITHUB_TOKEN=github_pat_test",
-	} {
-		if !strings.Contains(envText, want) {
-			t.Fatalf(".env missing %q:\n%s", want, envText)
-		}
-	}
-}
-
-func TestStoreUpdateRejectsInvalidUpdateRepo(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("CHATGPT2API_ROOT", root)
-	unsetEnv(t, "CHATGPT2API_UPDATE_REPO")
-
-	store, err := NewStore()
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-	if _, err := store.Update(map[string]any{"update_repo": "invalid"}); err == nil {
-		t.Fatal("Update() accepted invalid update_repo")
-	}
-}
-
-func assertConfigValue(t *testing.T, data map[string]any, key string, want any) {
-	t.Helper()
-	if got := data[key]; got != want {
-		t.Fatalf("%s = %#v, want %#v", key, got, want)
-	}
-}
-
-func unsetEnv(t *testing.T, key string) {
-	t.Helper()
-	original, existed := os.LookupEnv(key)
-	if err := os.Unsetenv(key); err != nil {
-		t.Fatalf("Unsetenv(%s): %v", key, err)
-	}
-	t.Cleanup(func() {
-		if existed {
-			_ = os.Setenv(key, original)
-		} else {
-			_ = os.Unsetenv(key)
-		}
-	})
-}
-
-func unsetLinuxDoEnv(t *testing.T) {
-	t.Helper()
-	for _, key := range []string{
-		"CHATGPT2API_LINUXDO_ENABLED",
-		"CHATGPT2API_LINUXDO_CLIENT_ID",
-		"CHATGPT2API_LINUXDO_CLIENT_SECRET",
-		"CHATGPT2API_LINUXDO_REDIRECT_URL",
-		"CHATGPT2API_LINUXDO_AUTHORIZE_URL",
-		"CHATGPT2API_LINUXDO_TOKEN_URL",
-		"CHATGPT2API_LINUXDO_USERINFO_URL",
-		"CHATGPT2API_LINUXDO_SCOPES",
-		"CHATGPT2API_LINUXDO_FRONTEND_REDIRECT_URL",
-		"CHATGPT2API_LINUXDO_TOKEN_AUTH_METHOD",
-		"CHATGPT2API_LINUXDO_USE_PKCE",
-		"CHATGPT2API_LINUXDO_USERINFO_EMAIL_PATH",
-		"CHATGPT2API_LINUXDO_USERINFO_ID_PATH",
-		"CHATGPT2API_LINUXDO_USERINFO_USERNAME_PATH",
-	} {
-		unsetEnv(t, key)
-	}
-}
+

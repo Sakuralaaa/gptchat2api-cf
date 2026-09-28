@@ -74,8 +74,6 @@ import {
   supportsImageOutputCompression,
   supportsImageOutputControls,
   supportsStructuredImageParameters,
-  getDynamicModelOptions,
-  loadModelCatalog,
   usesOfficialImageRoute,
   updateManagedImageVisibility,
   type ImageModel,
@@ -1204,7 +1202,6 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
   const editingDraftSizeIsHighResolution = Boolean(
     editingDraftStructuredParameters && editingDraftImageSize && isHighResolutionImageSize(editingDraftImageSize),
   );
-  const composerModelOptions = getDynamicModelOptions();
   const selectedConversation = useMemo(
     () => conversations.find((item) => item.id === selectedConversationId) ?? null,
     [conversations, selectedConversationId],
@@ -1236,9 +1233,6 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
     conversationsRef.current = conversations;
   }, [conversations]);
 
-  useEffect(() => {
-    void loadModelCatalog();
-  }, []);
 
   useEffect(() => {
     const node = composerDockRef.current;
@@ -3394,7 +3388,6 @@ function ImagePageContent({ session }: { session: NonNullable<ReturnType<typeof 
                 prompt={imagePrompt}
                 imageCount={imageCount}
                 imageModel={imageModel}
-                imageModelOptions={composerModelOptions}
                 imageSizeMode={imageSizeMode}
                 imageAspectRatio={imageAspectRatio}
                 imageResolution={imageResolution}

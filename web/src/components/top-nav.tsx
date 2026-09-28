@@ -5,7 +5,6 @@ import { ChevronDown, ChevronUp, Github, LogOut, MoonStar, Send, Sun, UserCircle
 import { motion, useReducedMotion, type Transition } from "motion/react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 
-import { AnnouncementNotifications } from "@/components/announcement-banner";
 import { ImageTaskQueue } from "@/components/image-task-queue";
 import webConfig from "@/constants/common-env";
 import {
@@ -409,7 +408,6 @@ export function TopNav() {
           </Button>
           <div className="ml-auto flex shrink-0 items-center gap-1 lg:hidden">
             {canAccessImageTasks ? <ImageTaskQueue className="size-8 px-0" /> : null}
-            <AnnouncementNotifications target="image" className="size-8" />
             <ThemeToggleButton theme={theme} onToggle={handleThemeToggle} />
             <AccountMenu
               session={session}
@@ -434,7 +432,6 @@ export function TopNav() {
         </nav>
         <div className="hidden items-center justify-end gap-1.5 lg:flex">
           {canAccessImageTasks ? <ImageTaskQueue /> : null}
-          <AnnouncementNotifications target="image" className="size-8" />
           <ThemeToggleButton theme={theme} onToggle={handleThemeToggle} />
           <AccountMenu
             session={session}

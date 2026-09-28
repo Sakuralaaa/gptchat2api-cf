@@ -37,13 +37,6 @@ var settingEnvKeys = map[string]string{
 	"log_retention_days":                "CHATGPT2API_LOG_RETENTION_DAYS",
 	"default_log_view":                  "CHATGPT2API_DEFAULT_LOG_VIEW",
 	"log_levels":                        "CHATGPT2API_LOG_LEVELS",
-	"linuxdo_enabled":                   "CHATGPT2API_LINUXDO_ENABLED",
-	"linuxdo_client_id":                 "CHATGPT2API_LINUXDO_CLIENT_ID",
-	"linuxdo_client_secret":             "CHATGPT2API_LINUXDO_CLIENT_SECRET",
-	"linuxdo_redirect_url":              "CHATGPT2API_LINUXDO_REDIRECT_URL",
-	"linuxdo_frontend_redirect_url":     "CHATGPT2API_LINUXDO_FRONTEND_REDIRECT_URL",
-	"update_repo":                       "CHATGPT2API_UPDATE_REPO",
-	"update_github_token":               "CHATGPT2API_UPDATE_GITHUB_TOKEN",
 	"registration_enabled":              "CHATGPT2API_REGISTRATION_ENABLED",
 	"login_page_image_url":              "CHATGPT2API_LOGIN_PAGE_IMAGE_URL",
 	"login_page_image_mode":             "CHATGPT2API_LOGIN_PAGE_IMAGE_MODE",
@@ -69,23 +62,6 @@ type Store struct {
 	EnvFile        string
 	data           map[string]any
 	storageBackend storage.Backend
-}
-
-type LinuxDoOAuthConfig struct {
-	Enabled              bool
-	ClientID             string
-	ClientSecret         string
-	AuthorizeURL         string
-	TokenURL             string
-	UserInfoURL          string
-	Scopes               string
-	RedirectURL          string
-	FrontendRedirectURL  string
-	TokenAuthMethod      string
-	UsePKCE              bool
-	UserInfoEmailPath    string
-	UserInfoIDPath       string
-	UserInfoUsernamePath string
 }
 
 func NewStore() (*Store, error) {
@@ -304,20 +280,6 @@ func (s *Store) FlareSolverr() string {
 	return strings.TrimSpace(fmt.Sprint(s.settingValue("flaresolverr", "")))
 }
 
-func (s *Store) UpdateProxyURL() string {
-	if value := strings.TrimSpace(os.Getenv("CHATGPT2API_UPDATE_PROXY_URL")); value != "" {
-		return value
-	}
-	return s.Proxy()
-}
-
-func (s *Store) UpdateRepo() string {
-	return normalizeUpdateRepo(s.settingValue("update_repo", "ZyphrZero/chatgpt2api"))
-}
-
-func (s *Store) UpdateGitHubToken() string {
-	return strings.TrimSpace(fmt.Sprint(s.settingValue("update_github_token", "")))
-}
 
 func (s *Store) LogLevels() []string {
 	raw := s.settingValue("log_levels", "")
@@ -341,54 +303,6 @@ func (s *Store) LogLevels() []string {
 		}
 	}
 	return out
-}
-
-func (s *Store) LinuxDoOAuth() LinuxDoOAuthConfig {
-	s.mu.RLock()
-	data := util.CopyMap(s.data)
-	s.mu.RUnlock()
-	return s.linuxDoOAuthFromData(data)
-}
-
-func (s *Store) linuxDoOAuthFromData(data map[string]any) LinuxDoOAuthConfig {
-	redirectURL := strings.TrimSpace(fmt.Sprint(s.settingValueFromData(data, "linuxdo_redirect_url", "")))
-	baseURL := strings.TrimRight(strings.TrimSpace(fmt.Sprint(s.settingValueFromData(data, "base_url", ""))), "/")
-	if redirectURL == "" && baseURL != "" {
-		redirectURL = baseURL + "/auth/linuxdo/oauth/callback"
-	}
-	return LinuxDoOAuthConfig{
-		Enabled:              util.ToBool(s.settingValueFromData(data, "linuxdo_enabled", false)),
-		ClientID:             strings.TrimSpace(fmt.Sprint(s.settingValueFromData(data, "linuxdo_client_id", ""))),
-		ClientSecret:         strings.TrimSpace(fmt.Sprint(s.settingValueFromData(data, "linuxdo_client_secret", ""))),
-		AuthorizeURL:         envString("CHATGPT2API_LINUXDO_AUTHORIZE_URL", "https://connect.linux.do/oauth2/authorize"),
-		TokenURL:             envString("CHATGPT2API_LINUXDO_TOKEN_URL", "https://connect.linux.do/oauth2/token"),
-		UserInfoURL:          envString("CHATGPT2API_LINUXDO_USERINFO_URL", "https://connect.linux.do/api/user"),
-		Scopes:               envString("CHATGPT2API_LINUXDO_SCOPES", "user"),
-		RedirectURL:          redirectURL,
-		FrontendRedirectURL:  strings.TrimSpace(fmt.Sprint(s.settingValueFromData(data, "linuxdo_frontend_redirect_url", "/auth/linuxdo/callback"))),
-		TokenAuthMethod:      strings.ToLower(envString("CHATGPT2API_LINUXDO_TOKEN_AUTH_METHOD", "client_secret_post")),
-		UsePKCE:              envBool("CHATGPT2API_LINUXDO_USE_PKCE", false),
-		UserInfoEmailPath:    envString("CHATGPT2API_LINUXDO_USERINFO_EMAIL_PATH", ""),
-		UserInfoIDPath:       envString("CHATGPT2API_LINUXDO_USERINFO_ID_PATH", ""),
-		UserInfoUsernamePath: envString("CHATGPT2API_LINUXDO_USERINFO_USERNAME_PATH", ""),
-	}
-}
-
-func (c LinuxDoOAuthConfig) Ready() bool {
-	if !c.Enabled {
-		return false
-	}
-	if c.ClientID == "" || c.AuthorizeURL == "" || c.TokenURL == "" || c.UserInfoURL == "" || c.RedirectURL == "" {
-		return false
-	}
-	switch c.TokenAuthMethod {
-	case "", "client_secret_post", "client_secret_basic":
-		return c.ClientSecret != ""
-	case "none":
-		return c.UsePKCE
-	default:
-		return false
-	}
 }
 
 func (s *Store) ImagesDir() string {
@@ -461,21 +375,11 @@ func (s *Store) Get() map[string]any {
 	data["flaresolverr"] = s.FlareSolverr()
 	data["base_url"] = s.BaseURL()
 	data["registration_enabled"] = s.RegistrationEnabled()
-	linuxdo := s.LinuxDoOAuth()
-	data["linuxdo_enabled"] = linuxdo.Enabled
-	data["linuxdo_client_id"] = linuxdo.ClientID
-	data["linuxdo_client_secret_configured"] = linuxdo.ClientSecret != ""
-	data["linuxdo_redirect_url"] = linuxdo.RedirectURL
-	data["linuxdo_frontend_redirect_url"] = linuxdo.FrontendRedirectURL
-	data["update_repo"] = s.UpdateRepo()
-	data["update_github_token_configured"] = s.UpdateGitHubToken() != ""
 	data["login_page_image_url"] = s.LoginPageImageURL()
 	data["login_page_image_mode"] = s.LoginPageImageMode()
 	data["login_page_image_zoom"] = s.LoginPageImageZoom()
 	data["login_page_image_position_x"] = s.LoginPageImagePositionX()
 	data["login_page_image_position_y"] = s.LoginPageImagePositionY()
-	delete(data, "linuxdo_client_secret")
-	delete(data, "update_github_token")
 	return data
 }
 
@@ -483,29 +387,7 @@ func (s *Store) Update(data map[string]any) (map[string]any, error) {
 	s.mu.Lock()
 	next := util.CopyMap(s.data)
 	for key, value := range data {
-		if key == "linuxdo_client_secret_configured" {
-			continue
-		}
-		if key == "update_github_token_configured" {
-			continue
-		}
-		if key == "linuxdo_client_secret" && strings.TrimSpace(fmt.Sprint(value)) == "" {
-			continue
-		}
-		if key == "update_github_token" && strings.TrimSpace(fmt.Sprint(value)) == "" {
-			continue
-		}
 		next[key] = value
-	}
-	delete(next, "image_concurrent_limit")
-	if value, ok := next["login_page_image_mode"]; ok {
-		next["login_page_image_mode"] = normalizeLoginPageImageMode(value)
-	}
-	if value, ok := next["image_task_timeout_seconds"]; ok {
-		next["image_task_timeout_seconds"] = normalizeImageTaskTimeoutSeconds(value)
-	}
-	if value, ok := next["text_account_schedule_mode"]; ok {
-		next["text_account_schedule_mode"] = normalizeAccountScheduleMode(value)
 	}
 	if value, ok := next["image_account_schedule_mode"]; ok {
 		next["image_account_schedule_mode"] = normalizeAccountScheduleMode(value)
@@ -522,7 +404,6 @@ func (s *Store) Update(data map[string]any) (map[string]any, error) {
 	if value, ok := next["default_log_view"]; ok {
 		next["default_log_view"] = normalizeDefaultLogView(value)
 	}
-	next["update_repo"] = normalizeUpdateRepo(util.ValueOr(next["update_repo"], "ZyphrZero/chatgpt2api"))
 	if err := s.validateSettingsUpdateLocked(next); err != nil {
 		s.mu.Unlock()
 		return nil, err
@@ -602,40 +483,6 @@ func (s *Store) settingValueFromData(data map[string]any, key string, fallback a
 }
 
 func (s *Store) validateSettingsUpdateLocked(data map[string]any) error {
-	if err := validateUpdateRepo(util.Clean(util.ValueOr(data["update_repo"], "ZyphrZero/chatgpt2api"))); err != nil {
-		return err
-	}
-	linuxdo := s.linuxDoOAuthFromData(data)
-	if !linuxdo.Enabled {
-		return nil
-	}
-	if linuxdo.ClientID == "" {
-		return errors.New("Linuxdo Client ID is required when enabled")
-	}
-	if linuxdo.RedirectURL == "" {
-		return errors.New("Linuxdo Redirect URL is required when enabled")
-	}
-	if linuxdo.FrontendRedirectURL == "" {
-		return errors.New("Linuxdo Frontend Redirect URL is required when enabled")
-	}
-	if err := validateAbsoluteHTTPURL(linuxdo.RedirectURL); err != nil {
-		return errors.New("Linuxdo Redirect URL must be an absolute http(s) URL")
-	}
-	if err := validateFrontendRedirectURL(linuxdo.FrontendRedirectURL); err != nil {
-		return errors.New("Linuxdo Frontend Redirect URL must be an absolute http(s) URL or a relative path")
-	}
-	switch linuxdo.TokenAuthMethod {
-	case "", "client_secret_post", "client_secret_basic":
-		if linuxdo.ClientSecret == "" {
-			return errors.New("Linuxdo Client Secret is required when enabled")
-		}
-	case "none":
-		if !linuxdo.UsePKCE {
-			return errors.New("Linuxdo PKCE must be enabled when token auth method is none")
-		}
-	default:
-		return errors.New("Linuxdo token auth method must be one of client_secret_post, client_secret_basic, none")
-	}
 	return nil
 }
 
@@ -648,58 +495,6 @@ func normalizeDefaultLogView(value any) string {
 	}
 }
 
-func normalizeUpdateRepo(value any) string {
-	repo := strings.Trim(strings.TrimSpace(fmt.Sprint(value)), "/")
-	if repo == "" {
-		return "ZyphrZero/chatgpt2api"
-	}
-	return repo
-}
-
-func validateUpdateRepo(value string) error {
-	if !regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`).MatchString(value) {
-		return errors.New("Update repository must use owner/repo format")
-	}
-	return nil
-}
-
-func validateAbsoluteHTTPURL(value string) error {
-	parsed, err := url.Parse(strings.TrimSpace(value))
-	if err != nil {
-		return err
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("scheme must be http or https")
-	}
-	if parsed.Host == "" {
-		return errors.New("host is required")
-	}
-	return nil
-}
-
-func validateFrontendRedirectURL(value string) error {
-	value = strings.TrimSpace(value)
-	if strings.ContainsAny(value, "\r\n") {
-		return errors.New("newlines are not allowed")
-	}
-	parsed, err := url.Parse(value)
-	if err != nil {
-		return err
-	}
-	if parsed.Scheme != "" {
-		if parsed.Scheme != "http" && parsed.Scheme != "https" {
-			return errors.New("scheme must be http or https")
-		}
-		if parsed.Host == "" {
-			return errors.New("host is required")
-		}
-		return nil
-	}
-	if !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") {
-		return errors.New("relative path must start with one slash")
-	}
-	return nil
-}
 
 func (s *Store) saveLocked() error {
 	updates := map[string]string{}

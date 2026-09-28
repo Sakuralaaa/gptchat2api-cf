@@ -5,18 +5,15 @@ import { LoaderCircle } from "lucide-react";
 
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
-import { AnnouncementsCard } from "./components/announcements-card";
 import { ConfigCard } from "./components/config-card";
 import { CPAPoolDialog } from "./components/cpa-pool-dialog";
 import { CPAPoolsCard } from "./components/cpa-pools-card";
 import { ImageStorageGovernanceCard } from "./components/image-storage-governance-card";
 import { ImportBrowserDialog } from "./components/import-browser-dialog";
-import { LinuxDoLoginCard } from "./components/linuxdo-login-card";
 import { LogGovernanceCard } from "./components/log-governance-card";
 import { LoginPageImageCard } from "./components/login-page-image-card";
 import { SettingsHeader } from "./components/settings-header";
 import { Sub2APIConnections } from "./components/sub2api-connections";
-import { VersionUpdateCard } from "./components/version-update-card";
 import { useSettingsStore } from "./store";
 
 function SettingsDataController() {
@@ -66,9 +63,6 @@ function AdminSettingsPageContent({
       <SettingsHeader />
       <section className="columns-1 gap-5 md:columns-2">
         <SettingsMasonryItem>
-          <VersionUpdateCard canManageSystem={canManageSystem} />
-        </SettingsMasonryItem>
-        <SettingsMasonryItem>
           <ConfigCard />
         </SettingsMasonryItem>
         <SettingsMasonryItem>
@@ -78,13 +72,7 @@ function AdminSettingsPageContent({
           <ImageStorageGovernanceCard />
         </SettingsMasonryItem>
         <SettingsMasonryItem>
-          <LinuxDoLoginCard />
-        </SettingsMasonryItem>
-        <SettingsMasonryItem>
           <LoginPageImageCard />
-        </SettingsMasonryItem>
-        <SettingsMasonryItem>
-          <AnnouncementsCard />
         </SettingsMasonryItem>
         <SettingsMasonryItem>
           <CPAPoolsCard />

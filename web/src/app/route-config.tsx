@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 
 import AccountsPage from "@/app/accounts/page";
-import LinuxDoCallbackPage from "@/app/auth/linuxdo/callback/page";
 import ImagePage from "@/app/image/page";
 import ImageManagerPage from "@/app/image-manager/page";
 import HomePage from "@/app/page";
@@ -22,7 +21,6 @@ export type AppRouteConfig = {
 export const appRoutes: AppRouteConfig[] = [
   { path: "/", element: <HomePage /> },
   { path: "/login", element: <LoginPage /> },
-  { path: "/auth/linuxdo/callback", element: <LinuxDoCallbackPage /> },
   { path: "/accounts", element: <AccountsPage />, requiredPath: "/accounts" },
   { path: "/register", element: <RegisterPage />, requiredPath: "/register" },
   { path: "/image-manager", element: <ImageManagerPage />, requiredPath: "/image-manager" },

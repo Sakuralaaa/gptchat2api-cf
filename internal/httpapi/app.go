@@ -50,14 +50,12 @@ type App struct {
 	engine     *protocol.Engine
 	images     *service.ImageService
 	tasks      *service.ImageTaskService
-	announce   *service.AnnouncementService
 	prompts    *service.PromptFavoriteService
 	cpa        *service.CPAConfig
 	cpaImport  *service.CPAImportService
 	sub2       *service.Sub2APIConfig
 	sub2Import *service.Sub2APIService
 	register   *service.RegisterService
-	update     *service.UpdateService
 	cancel     context.CancelFunc
 }
 
@@ -96,7 +94,7 @@ func NewApp() (*App, error) {
 	documentStore, _ := storageBackend.(storage.JSONDocumentBackend)
 	imageSessions := service.NewImageConversationSessionService(filepath.Join(cfg.DataDir, "image_conversation_sessions.json"), storageBackend)
 	engine := &protocol.Engine{Accounts: accounts, Config: cfg, Storage: documentStore, Proxy: proxy, Logger: logger, ImageConversationSessions: imageSessions}
-	app := &App{config: cfg, auth: auth, accounts: accounts, billing: billing, logs: logs, logger: logger, proxy: proxy, engine: engine, images: service.NewImageService(cfg, storageBackend), announce: service.NewAnnouncementService(storageBackend), prompts: service.NewPromptFavoriteService(storageBackend), cpa: service.NewCPAConfig(storageBackend), sub2: service.NewSub2APIConfig(storageBackend), update: newUpdateService(cfg), cancel: cancel}
+	app := &App{config: cfg, auth: auth, accounts: accounts, billing: billing, logs: logs, logger: logger, proxy: proxy, engine: engine, images: service.NewImageService(cfg, storageBackend), prompts: service.NewPromptFavoriteService(storageBackend), cpa: service.NewCPAConfig(storageBackend), sub2: service.NewSub2APIConfig(storageBackend), cancel: cancel}
 	app.cpaImport = service.NewCPAImportService(app.cpa, accounts, proxy)
 	app.sub2Import = service.NewSub2APIService(app.sub2, accounts)
 	app.register = service.NewRegisterService(accounts, storageBackend)
@@ -127,21 +125,9 @@ func NewApp() (*App, error) {
 	})
 	accounts.StartLimitedWatcher(ctx, time.Duration(cfg.RefreshAccountIntervalMinute())*time.Minute)
 	logs.StartRetentionCleaner(ctx, cfg.LogRetentionDays, 24*time.Hour, logger)
-	_, _ = app.images.CleanupStorage(service.ImageStorageCleanupOptions{
-		RetentionDays: cfg.ImageRetentionDays(),
-		MaxBytes:      cfg.ImageStorageLimitBytes(),
-	})
 	return app, nil
 }
-
-func newUpdateService(cfg *config.Store) *service.UpdateService {
-	return service.NewUpdateService(service.UpdateOptions{
-		CurrentVersion: version.Get(),
-		BuildType:      version.GetBuildType(),
-		Repo:           cfg.UpdateRepo(),
-		ProxyURL:       cfg.UpdateProxyURL(),
-		GitHubToken:    cfg.UpdateGitHubToken(),
-	})
+	return app, nil
 }
 
 func (a *App) Close() {
@@ -570,7 +556,6 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 			util.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		a.update = newUpdateService(a.config)
 		util.WriteJSON(w, http.StatusOK, map[string]any{"config": updated})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1636,7 +1621,6 @@ func (a *App) recordGeneratedImages(identity service.Identity, urls []string, vi
 	}
 	ownerID := identityScope(identity)
 	a.images.RecordGeneratedImages(urls, ownerID, identityDisplayName(identity), visibility)
-	a.cleanupImageStorage()
 }
 
 func (a *App) recordProtocolGeneratedImages(identity service.Identity, urls []string, visibility string, payloads ...map[string]any) {
@@ -1679,19 +1663,7 @@ func (a *App) recordGeneratedImagesForPayload(identity service.Identity, urls []
 		SharePromptParams: sharePromptParams,
 		ShareReferences:   sharePromptParams && util.ToBool(payload["share_reference_images"]),
 	})
-	a.cleanupImageStorage()
 }
-
-func (a *App) cleanupImageStorage() {
-	if a == nil || a.images == nil || a.config == nil {
-		return
-	}
-	_, _ = a.images.CleanupStorage(service.ImageStorageCleanupOptions{
-		RetentionDays: a.config.ImageRetentionDays(),
-		MaxBytes:      a.config.ImageStorageLimitBytes(),
-	})
-}
-
 func imageReferenceMetadataFromPayload(payload map[string]any) []service.GeneratedImageReference {
 	if payload == nil {
 		return nil

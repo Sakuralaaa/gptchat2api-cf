@@ -46,18 +46,12 @@ func (a *App) routes() []appRoute {
 		exact(http.MethodPost, "/auth/register", a.handleAccountRegister),
 		exact(http.MethodGet, "/auth/session", a.handleSession),
 		exact("", "/auth/providers", a.handleAuthProviders),
-		exact("", "/auth/linuxdo/start", a.handleLinuxDoOAuthStart),
-		exact("", "/auth/linuxdo/oauth/callback", a.handleLinuxDoOAuthCallback),
-		exact(http.MethodGet, "/auth/linuxdo/callback", a.serveWeb),
-		exact(http.MethodHead, "/auth/linuxdo/callback", a.serveWeb),
 		exact(http.MethodGet, "/health", a.handleHealth),
 		exact(http.MethodGet, "/version", func(w http.ResponseWriter, _ *http.Request) {
 			util.WriteJSON(w, http.StatusOK, map[string]any{"version": version.Get()})
 		}),
 
-		exact("", "/api/announcements", a.handlePublicAnnouncements),
 		subtree("/api/admin/system", a.handleAdminSystem),
-		subtree("/api/admin/announcements", a.handleAdminAnnouncements),
 		subtree("/api/admin/roles", a.handleAdminRoles),
 		subtree("/api/admin/users", a.handleAdminUsers),
 		exact("", "/api/profile", a.handleProfile),

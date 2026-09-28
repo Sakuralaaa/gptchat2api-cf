@@ -285,10 +285,6 @@ func (r *ImageStorageCleanupResult) addRemovalStats(stats imageStorageRemovalSta
 }
 
 func (s *ImageService) ListImages(baseURL, startDate, endDate string, scope ImageAccessScope) map[string]any {
-	_, _ = s.CleanupStorage(ImageStorageCleanupOptions{
-		RetentionDays: s.config.ImageRetentionDays(),
-		MaxBytes:      s.config.ImageStorageLimitBytes(),
-	})
 	root := s.config.ImagesDir()
 	items := make([]map[string]any, 0)
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {

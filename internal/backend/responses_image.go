@@ -338,7 +338,7 @@ func normalizeResponsesImageToolModel(model string) string {
 	switch strings.ToLower(strings.TrimSpace(model)) {
 	case "", util.ImageModelAuto, "gpt-image-1", util.ImageModelGPT:
 		return ""
-	case util.ImageModelGPT25:
+	case util.ImageModelGPT25, util.ImageModelGPT25Flare, util.ImageModelGPT25Sunburst:
 		return util.ImageModelGPT25
 	case util.ImageModelCodex:
 		return ResponsesImageCodexToolModel
@@ -749,7 +749,7 @@ func officialImageModelSlug(model string) string {
 	switch strings.TrimSpace(model) {
 	case util.ImageModelGPT:
 		return "gpt-5-5"
-	case util.ImageModelGPT25:
+	case util.ImageModelGPT25, util.ImageModelGPT25Flare, util.ImageModelGPT25Sunburst:
 		return "gpt-image-2-5"
 	case util.ImageModelCodex:
 		return util.ImageModelCodex

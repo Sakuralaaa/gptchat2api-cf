@@ -20,6 +20,8 @@ const (
 	ImageModelAuto       = "auto"
 	ImageModelGPT        = "gpt-image-2"
 	ImageModelGPT25      = "gpt-image-2.5"
+	ImageModelGPT25Flare    = "gpt-image-2.5-flare"
+	ImageModelGPT25Sunburst = "gpt-image-2.5-sunburst"
 	ImageModelCodex      = "codex-gpt-image-2"
 	ImageModelGPT5       = "gpt-5"
 	ImageModelGPT51      = "gpt-5-1"
@@ -32,14 +34,18 @@ const (
 	ImageModelGPTMini    = "gpt-5-mini"
 )
 var ImageModels = map[string]struct{}{
-	ImageModelGPT:   {},
-	ImageModelGPT25: {},
-	ImageModelCodex: {},
+	ImageModelGPT:           {},
+	ImageModelGPT25:         {},
+	ImageModelGPT25Flare:    {},
+	ImageModelGPT25Sunburst: {},
+	ImageModelCodex:         {},
 }
 
 var ModelIDs = []string{
 	ImageModelGPT,
 	ImageModelGPT25,
+	ImageModelGPT25Flare,
+	ImageModelGPT25Sunburst,
 	ImageModelCodex,
 	ImageModelAuto,
 	ImageModelGPTMini,
@@ -56,10 +62,11 @@ var ModelIDs = []string{
 var ImageGenerationModelIDs = []string{
 	ImageModelGPT,
 	ImageModelGPT25,
+	ImageModelGPT25Flare,
+	ImageModelGPT25Sunburst,
 	ImageModelCodex,
 	ImageModelAuto,
 }
-
 var ImageGenerationModels = map[string]struct{}{}
 
 func init() {
@@ -69,19 +76,21 @@ func init() {
 }
 
 var ResponsesImageToolModels = map[string]struct{}{
-	ImageModelAuto:       {},
-	ImageModelGPT:        {},
-	ImageModelGPT25:      {},
-	ImageModelCodex:      {},
-	ImageModelGPTMini:    {},
-	ImageModelGPT53Mini:  {},
-	ImageModelGPT5:       {},
-	ImageModelGPT51:      {},
-	ImageModelGPT52:      {},
-	ImageModelGPT53:      {},
-	ImageModelGPT54:      {},
-	ImageModelGPT55:      {},
-	ImageModelGPT56:      {},
+	ImageModelAuto:          {},
+	ImageModelGPT:           {},
+	ImageModelGPT25:         {},
+	ImageModelGPT25Flare:    {},
+	ImageModelGPT25Sunburst: {},
+	ImageModelCodex:         {},
+	ImageModelGPTMini:       {},
+	ImageModelGPT53Mini:     {},
+	ImageModelGPT5:          {},
+	ImageModelGPT51:         {},
+	ImageModelGPT52:         {},
+	ImageModelGPT53:         {},
+	ImageModelGPT54:         {},
+	ImageModelGPT55:         {},
+	ImageModelGPT56:         {},
 }
 
 
