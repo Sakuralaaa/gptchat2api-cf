@@ -49,6 +49,7 @@ func TestModelListIncludesTextAndImageModels(t *testing.T) {
 		ImageModelGPT53,
 		ImageModelGPT54,
 		ImageModelGPT55,
+		ImageModelGPT56,
 	}
 	gotOrder := ModelList()
 	if len(gotOrder) != len(wantOrder) {

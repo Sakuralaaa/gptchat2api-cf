@@ -1176,12 +1176,7 @@ func (w *registerWorker) requestFormWithHeaders(ctx context.Context, target stri
 		}
 		defer resp.Body.Close()
 		payload := map[string]any{}
-		defer resp.Body.Close()
-		payload := map[string]any{}
 		_ = util.DecodeJSON(resp.Body, &payload)
-		return resp.StatusCode, payload, nil
-	}
-		}
 		return resp.StatusCode, payload, nil
 	}
 	if lastErr != nil {
