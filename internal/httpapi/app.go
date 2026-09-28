@@ -177,7 +177,6 @@ func (a *App) handleModels(w http.ResponseWriter, r *http.Request) {
 // console so newly released upstream models appear without a redeploy.
 func (a *App) handleModelCatalog(w http.ResponseWriter, r *http.Request) {
 	if _, ok := a.requireIdentity(w, r, ""); !ok {
-	if !ok {
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, a.engine.BuildModelCatalog(r.Context()))
