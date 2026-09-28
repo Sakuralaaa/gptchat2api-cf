@@ -1457,7 +1457,6 @@ func TestResponseImageGenerationRequestDefaultsImageModelForAuto(t *testing.T) {
 	if request.Model != "gpt-image-2.5" {
 		t.Fatalf("model = %q, want gpt-image-2.5 official image route", request.Model)
 	}
-	}
 	if request.Size != "auto" {
 		t.Fatalf("size = %q, want auto", request.Size)
 	}
