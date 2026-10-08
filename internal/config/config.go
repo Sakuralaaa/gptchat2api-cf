@@ -549,7 +549,11 @@ func (s *Store) loadPersistentSettings() {
 		return
 	}
 	s.storageBackend = backend
-	doc, err := backend.LoadJSONDocument(settingsDocName)
+	docBackend, ok := backend.(storage.JSONDocumentBackend)
+	if !ok {
+		return
+	}
+	doc, err := docBackend.LoadJSONDocument(settingsDocName)
 	if err != nil || doc == nil {
 		return
 	}
@@ -574,7 +578,11 @@ func (s *Store) savePersistentSettingsLocked() {
 	if s.storageBackend == nil {
 		return
 	}
-	if err := s.storageBackend.SaveJSONDocument(settingsDocName, util.CopyMap(s.data)); err != nil {
+	docBackend, ok := s.storageBackend.(storage.JSONDocumentBackend)
+	if !ok {
+		return
+	}
+	if err := docBackend.SaveJSONDocument(settingsDocName, util.CopyMap(s.data)); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to persist settings: %v\n", err)
 	}
 }
