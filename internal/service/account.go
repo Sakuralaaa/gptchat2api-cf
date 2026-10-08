@@ -74,7 +74,7 @@ type AccountService struct {
 	random                    *rand.Rand
 	refresher                 *SessionRefresher
 	reloginRunning            map[string]struct{}
-	reloginHook               func(accessToken, email, password string) error
+	reloginHook               func(accessToken string, creds map[string]any) (string, string, error)
 }
 
 const (
@@ -1965,6 +1965,10 @@ func (s *AccountService) markReloginPending(accessToken string) bool {
 	_ = s.saveLocked()
 	return true
 }
+
+// maxReloginFailures removes an account after this many consecutive failed
+// password relogins.
+const maxReloginFailures = 3
 
 func (s *AccountService) finishRelogin(accessToken string) {
 	s.mu.Lock()

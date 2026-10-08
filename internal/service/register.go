@@ -328,7 +328,7 @@ func (s *RegisterService) reloginAccount(accessToken string, creds map[string]an
 func (w *registerWorker) reloginSession(ctx context.Context, email, password string, creds map[string]any) (string, string, error) {
 	mailbox := reloginMailbox(email, creds, w.mail)
 	if err := w.prewarmCloudflare(ctx); err != nil {
-		w.step("密码重登 Cloudflare 预热失败（继续尝试）: %v", err)
+		w.step("密码重登 Cloudflare 预热失败（继续尝试）: " + err.Error())
 	}
 	flow := newRegisterFlow(w, ctx)
 	flow.email = email
@@ -539,10 +539,11 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	mailbox := result.Mailbox
-	if mailbox == nil {
-		mailbox = map[string]any{}
+	resultMailbox := result.Mailbox
+	if resultMailbox == nil {
+		resultMailbox = map[string]any{}
 	}
+	mailbox = resultMailbox
 	return map[string]any{
 		"email":         result.Email,
 		"password":      result.Password,
