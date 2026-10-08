@@ -56,6 +56,7 @@ type App struct {
 	sub2       *service.Sub2APIConfig
 	sub2Import *service.Sub2APIService
 	register   *service.RegisterService
+	recovery   *service.AccountRecovery
 	cancel     context.CancelFunc
 }
 
@@ -98,6 +99,7 @@ func NewApp() (*App, error) {
 	app.cpaImport = service.NewCPAImportService(app.cpa, accounts, proxy)
 	app.sub2Import = service.NewSub2APIService(app.sub2, accounts)
 	app.register = service.NewRegisterService(accounts, storageBackend)
+	app.recovery = service.NewAccountRecovery(accounts, app.register)
 	app.tasks = service.NewStoredImageTaskService(storageBackend,
 		func(ctx context.Context, identity service.Identity, payload map[string]any) (map[string]any, error) {
 			return app.runLoggedImageTask(ctx, identity, payload, "/api/creation-tasks/image-generations", "文生图", func(ctx context.Context, payload map[string]any) (map[string]any, error) {

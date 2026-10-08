@@ -901,6 +901,32 @@ export async function createAccountFromSession(sessionJson: string) {
   });
 }
 
+export type AccountRecoveryStartResponse = {
+  started: Record<string, boolean>;
+  errors: Record<string, string>;
+};
+
+export async function startAccountRecovery(emails: string[]) {
+  return httpRequest<AccountRecoveryStartResponse>("/api/accounts/recover", {
+    method: "POST",
+    body: { emails },
+  });
+}
+
+export async function confirmAccountRecovery(email: string, otp: string) {
+  return httpRequest<{ ok: boolean; token_preview: string }>("/api/accounts/recover/confirm", {
+    method: "POST",
+    body: { email, otp },
+  });
+}
+
+export async function cancelAccountRecovery(email: string) {
+  return httpRequest<{ ok: boolean }>("/api/accounts/recover/cancel", {
+    method: "POST",
+    body: { email },
+  });
+}
+
 export async function deleteAccounts(accountIds: string[]) {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "DELETE",

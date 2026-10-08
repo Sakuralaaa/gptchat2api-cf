@@ -1119,6 +1119,42 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		a.redactAccountPayloadForIdentity(identity, result)
 		util.WriteJSON(w, http.StatusOK, result)
+	case r.URL.Path == "/api/accounts/recover" && r.Method == http.MethodPost:
+		body, err := readJSONMap(r)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			return
+		}
+		emails := util.AsStringSlice(body["emails"])
+		if len(emails) == 0 {
+			util.WriteError(w, http.StatusBadRequest, "emails is required")
+			return
+		}
+		started, errors := a.recovery.StartRecovery(emails)
+		util.WriteJSON(w, http.StatusOK, map[string]any{"started": started, "errors": errors})
+	case r.URL.Path == "/api/accounts/recover/confirm" && r.Method == http.MethodPost:
+		body, err := readJSONMap(r)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			return
+		}
+		email := util.Clean(body["email"])
+		code := util.Clean(body["otp"])
+		if email == "" {
+			util.WriteError(w, http.StatusBadRequest, "email is required")
+			return
+		}
+		result, err := a.recovery.ConfirmRecovery(email, code)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		result["email"] = email
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "token_preview": util.AnonymizeToken(util.Clean(result["access_token"]))})
+	case r.URL.Path == "/api/accounts/recover/cancel" && r.Method == http.MethodPost:
+		body, _ := readJSONMap(r)
+		a.recovery.CancelRecovery(util.Clean(body["email"]))
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case r.URL.Path == "/api/accounts" && r.Method == http.MethodDelete:
 		body, _ := readJSONMap(r)
 		tokens := util.AsStringSlice(body["tokens"])

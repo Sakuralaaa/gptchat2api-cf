@@ -10,6 +10,7 @@ import {
   Files,
   KeyRound,
   LoaderCircle,
+  MailQuestion,
   ServerCog,
   Upload,
 } from "lucide-react";
@@ -26,10 +27,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { createAccountFromSession, createAccounts, type Account } from "@/lib/api";
+import { Input } from "@/components/ui/input";
+import { cancelAccountRecovery, confirmAccountRecovery, createAccountFromSession, createAccounts, startAccountRecovery, type Account } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ImportMethod = "menu" | "token" | "session" | "cpa";
+type ImportMethod = "menu" | "token" | "session" | "cpa" | "recover";
 
 type AccountImportDialogProps = {
   disabled?: boolean;
@@ -117,6 +119,9 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
   const [sessionInput, setSessionInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [pendingCpaImport, setPendingCpaImport] = useState<PendingCpaImport | null>(null);
+  const [recoverInput, setRecoverInput] = useState("");
+  const [recoverPending, setRecoverPending] = useState<string[]>([]);
+  const [recoverOtp, setRecoverOtp] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
@@ -128,6 +133,9 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
     setSessionInput("");
     setPendingCpaImport(null);
     setConfirmOpen(false);
+    setRecoverInput("");
+    setRecoverPending([]);
+    setRecoverOtp("");
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
@@ -286,6 +294,79 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
     }
   };
 
+  const startRecovery = async () => {
+    const emails = splitTokens(recoverInput)
+      .map((item) => item.trim().toLowerCase())
+      .filter((item) => item.includes("@"));
+    if (emails.length === 0) {
+      toast.error("请先输入至少一个邮箱地址");
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const data = await startAccountRecovery(emails);
+      const started = Object.keys(data.started ?? {});
+      const failed = Object.entries(data.errors ?? {});
+      if (started.length === 0) {
+        toast.error(`验证码发送失败：${failed[0]?.[1] ?? "未知错误"}`);
+        return;
+      }
+      setRecoverPending(started);
+      setRecoverOtp("");
+      toast.success(`已向 ${started.length} 个邮箱发送验证码`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "发起找回失败");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const confirmRecovery = async () => {
+    if (recoverPending.length === 0) {
+      toast.error("请先发起找回");
+      return;
+    }
+    const code = recoverOtp.trim();
+    if (!/^[0-9]{6}$/.test(code)) {
+      toast.error("请输入 6 位数字验证码");
+      return;
+    }
+    setIsSubmitting(true);
+    const recovered: Account[] = [];
+    const failed: string[] = [];
+    try {
+      for (const email of recoverPending) {
+        try {
+          await confirmAccountRecovery(email, code);
+          recovered.push({ email } as Account);
+        } catch (error) {
+          failed.push(`${email}: ${error instanceof Error ? error.message : "失败"}`);
+        }
+      }
+      if (recovered.length > 0) {
+        onImported(recovered);
+        toast.success(`成功找回 ${recovered.length} 个账号`);
+        setOpen(false);
+        resetState();
+      } else {
+        toast.error(failed[0] ?? "验证码校验失败，请重试");
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const cancelRecovery = async () => {
+    const emails = [...recoverPending];
+    setRecoverPending([]);
+    for (const email of emails) {
+      try {
+        await cancelAccountRecovery(email);
+      } catch {
+        // best effort
+      }
+    }
+  };
   const renderMethodBody = () => {
     if (method === "token") {
       const tokenCount = splitTokens(tokenInput).length;
@@ -431,8 +512,64 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
       );
     }
 
+    if (method === "recover") {
+      return (
+        <div className="space-y-4">
+          <button
+            type="button"
+            onClick={() => { void cancelRecovery(); setMethod("menu"); }}
+            className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800"
+          >
+            <ArrowLeft className="size-4" />
+            返回导入方式
+          </button>
+          {recoverPending.length === 0 ? (
+            <>
+              <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600">
+                粘贴存量账号的邮箱地址（每行一个），系统将逐个发起免密登录并向邮箱发送验证码。收到验证码后填入下方完成找回，找回后的账号自动获得完整自愈凭证。
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700">邮箱地址列表</label>
+                <Textarea
+                  placeholder={"每行一个邮箱\nuser1@example.com\nuser2@example.com"}
+                  value={recoverInput}
+                  onChange={(event) => setRecoverInput(event.target.value)}
+                  className="min-h-40 resize-none rounded-xl border-stone-200 font-mono text-xs"
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm leading-6 text-emerald-900">
+                验证码已发送到 {recoverPending.length} 个邮箱。打开你的 CF 临时邮箱后台查看最新验证码并填入下方。
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700">验证码</label>
+                <Input
+                  placeholder="6 位数字验证码"
+                  value={recoverOtp}
+                  onChange={(event) => setRecoverOtp(event.target.value)}
+                  className="rounded-xl border-stone-200 font-mono"
+                  inputMode="numeric"
+                  maxLength={6}
+                />
+                <div className="text-xs text-stone-500">本次找回邮箱：{recoverPending.join("、")}</div>
+              </div>
+            </>
+          )}
+        </div>
+      );
+    }
     return (
       <div className="space-y-3">
+        {canImportTokens ? (
+          <MethodCard
+            title="邮箱找回存量账号"
+            description="只记得注册邮箱？发起免密登录，用邮箱验证码找回并补全自愈凭证。"
+            icon={MailQuestion}
+            onClick={() => setMethod("recover")}
+          />
+        ) : null}
         {canImportTokens ? (
           <MethodCard
             title="导入 Access Token"
@@ -505,7 +642,9 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
                   ? "导入 Access Token"
                   : method === "session"
                     ? "导入 Session JSON"
-                    : "导入 CPA JSON"}
+                    : method === "recover"
+                      ? "邮箱找回存量账号"
+                      : "导入 CPA JSON"}
             </DialogTitle>
             <DialogDescription className="text-sm leading-6">
               {method === "menu"
@@ -514,7 +653,9 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
                   ? "支持手动粘贴或从 TXT 文件导入，一行一个 Token。"
                   : method === "session"
                     ? "粘贴完整 Session JSON，系统会保存 accessToken 和 sessionToken。"
-                    : "支持一次读取多个本地 JSON 文件，并在提交前做数量确认。"}
+                    : method === "recover"
+                      ? "用注册邮箱的验证码免密登录，找回后自动补全 session_token 等自愈凭证。"
+                      : "支持一次读取多个本地 JSON 文件，并在提交前做数量确认。"}
             </DialogDescription>
           </DialogHeader>
 
@@ -549,7 +690,26 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
                 导入 JSON
               </Button>
             ) : null}
-            {method === "cpa" ? (
+            {method === "recover" && recoverPending.length === 0 ? (
+              <Button
+                className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+                onClick={() => void startRecovery()}
+                disabled={footerDisabled}
+              >
+                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                发送验证码
+              </Button>
+            ) : null}
+            {method === "recover" && recoverPending.length > 0 ? (
+              <Button
+                className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+                onClick={() => void confirmRecovery()}
+                disabled={footerDisabled}
+              >
+                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                确认找回
+              </Button>
+            ) : null}            {method === "cpa" ? (
               <Button
                 className={cn(
                   "h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800",

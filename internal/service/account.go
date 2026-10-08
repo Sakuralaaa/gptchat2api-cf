@@ -315,6 +315,59 @@ func (s *AccountService) AddRegisteredAccount(result map[string]any) {
 	})
 }
 
+// AddRecoveredAccount ingests an account recovered through the email-OTP
+// re-login. It matches an existing pool entry by email (a legacy token-only
+// entry) and upgrades it in place; when no entry matches, the account is
+// added fresh. Returns the effective access token.
+func (s *AccountService) AddRecoveredAccount(result map[string]any) string {
+	if s == nil {
+		return ""
+	}
+	accessToken := util.Clean(result["access_token"])
+	email := util.Clean(result["email"])
+	if accessToken == "" {
+		return ""
+	}
+	s.mu.Lock()
+	matched := ""
+	for _, item := range s.items {
+		if email != "" && strings.EqualFold(util.Clean(item["email"]), email) {
+			matched = util.Clean(item["access_token"])
+			break
+		}
+	}
+	s.mu.Unlock()
+
+	if matched == "" || matched == accessToken {
+		s.AddAccounts([]string{accessToken})
+	} else if s.RemoveToken(matched) {
+		s.AddAccounts([]string{accessToken})
+		s.logs.Add("找回的账号已替换旧条目", map[string]any{
+			"module":         "accounts",
+			"operation_type": "更新",
+			"email":          email,
+		})
+	}
+	updates := map[string]any{
+		"email":            email,
+		"refresh_failures": 0,
+		"refresh_next_at":  nil,
+		"relogin_failures": 0,
+		"status":           "正常",
+	}
+	if v := util.Clean(result["session_token"]); v != "" {
+		updates["session_token"] = v
+	}
+	s.UpdateAccount(accessToken, updates)
+	s.logs.Add("账号找回入库（含自愈凭证）", map[string]any{
+		"module":         "accounts",
+		"operation_type": "新增",
+		"email":          email,
+		"has_session":    updates["session_token"] != "",
+	})
+	return accessToken
+}
+
 // refreshBackoffDelays are the consecutive-failure backoff windows applied
 // before an account is declared abnormal (in order, indexed by failures-1).
 var refreshBackoffDelays = []time.Duration{
