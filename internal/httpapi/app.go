@@ -124,6 +124,7 @@ func NewApp() (*App, error) {
 		return time.Duration(app.config.ImageTaskTimeoutSeconds()) * time.Second
 	})
 	accounts.StartLimitedWatcher(ctx, time.Duration(cfg.RefreshAccountIntervalMinute())*time.Minute)
+	accounts.StartSessionRefreshWatcher(ctx, time.Minute)
 	logs.StartRetentionCleaner(ctx, cfg.LogRetentionDays, 24*time.Hour, logger)
 	return app, nil
 }

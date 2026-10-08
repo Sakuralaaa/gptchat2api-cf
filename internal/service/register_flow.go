@@ -44,6 +44,7 @@ type registerFlowResult struct {
 	Password     string
 	AccessToken  string
 	SessionToken string
+	Mailbox      map[string]any
 }
 
 type registerFlow struct {
@@ -703,7 +704,7 @@ func refererOf(rawURL string) string {
 // ── Orchestration: run_register ─────────────────────────────────────────────
 
 func (f *registerFlow) run(mailbox map[string]any) (registerFlowResult, error) {
-	result := registerFlowResult{Email: f.email}
+	result := registerFlowResult{Email: f.email, Mailbox: mailbox}
 
 	if !f.warmup() {
 		return result, fmt.Errorf("warmup 失败：4 次重试均未拿到 chatgpt.com 的 oai-did cookie，继续注册必然 409 invalid_state（多为出口 IP 被 CF 拦），请配置可用代理后重试")
@@ -828,6 +829,8 @@ func (f *registerFlow) run(mailbox map[string]any) (registerFlowResult, error) {
 	}
 	result.SessionToken = sessionToken
 	result.AccessToken = accessToken
+	result.Password = f.password
+	result.Mailbox = mailbox
 	if accessToken == "" {
 		return result, fmt.Errorf("注册完成但未获取有效 access_token")
 	}

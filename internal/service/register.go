@@ -119,6 +119,9 @@ func NewRegisterService(accounts *AccountService, backend ...storage.Backend) *R
 	if util.ToBool(s.config["enabled"]) {
 		s.startLocked(false)
 	}
+	if accounts != nil {
+		accounts.SetReloginHook(s.reloginAccount)
+	}
 	return s
 }
 
@@ -288,13 +291,153 @@ func (s *RegisterService) runWorker(index int, config map[string]any) registerWo
 		return registerWorkerResult{ok: false, index: index, err: err.Error(), cost: cost}
 	}
 	if s.accounts != nil {
-		s.accounts.AddAccounts([]string{accessToken})
+		s.accounts.AddRegisteredAccount(result)
 		s.accounts.RefreshAccounts(context.Background(), []string{accessToken})
 	}
 	s.appendLog(fmt.Sprintf("%s 注册成功，本次耗时%.1fs", util.Clean(result["email"]), cost), "green")
 	return registerWorkerResult{ok: true, index: index, result: result, cost: cost}
 }
 
+// reloginAccount is the password-relogin fallback registered on the account
+// pool (SetReloginHook). It rebuilds a register worker from the current mail
+// configuration, replays the login flow with the stored password, and returns
+// the renewed access/session tokens via the register session path (so the
+// session_token is refreshed too, not just the OAuth token).
+func (s *RegisterService) reloginAccount(accessToken string, creds map[string]any) (string, string, error) {
+	email := util.Clean(creds["email"])
+	password := util.Clean(creds["password"])
+	config := cloneMap(s.Get())
+	config["mail"] = cloneMap(util.StringMap(config["mail"]))
+	worker, err := newRegisterWorker(s, 0, config)
+	if err != nil {
+		return "", "", err
+	}
+	defer worker.close()
+	worker.index = 0
+	s.appendLog(fmt.Sprintf("密码重登开始: %s", email), "")
+	return worker.reloginSession(context.Background(), email, password, creds)
+}
+
+// reloginSession replays the interactive login with an isolated cookie jar and
+// finishes on chatgpt.com /api/auth/session (register_flow session path) so
+// both session_token and access_token are renewed. When the password check
+// answers with an email OTP challenge, the code is retrieved from the stored
+// CF temp-mail credentials (mail_provider/mail_ref/mail_token); a missing or
+// expired mail token falls back to re-creating the mailbox with the same
+// address prefix.
+func (w *registerWorker) reloginSession(ctx context.Context, email, password string, creds map[string]any) (string, string, error) {
+	mailbox := reloginMailbox(email, creds, w.mail)
+	if err := w.prewarmCloudflare(ctx); err != nil {
+		w.step("密码重登 Cloudflare 预热失败（继续尝试）: %v", err)
+	}
+	flow := newRegisterFlow(w, ctx)
+	flow.email = email
+	if !flow.warmup() {
+		return "", "", fmt.Errorf("relogin warmup failed: chatgpt.com oai-did cookie not planted")
+	}
+	csrf, err := flow.getCSRFToken()
+	if err != nil {
+		return "", "", err
+	}
+	authURL, err := flow.getAuthURL(csrf)
+	if err != nil {
+		return "", "", err
+	}
+	if _, err := flow.authOAuthInit(authURL); err != nil {
+		return "", "", err
+	}
+	w.step("开始提交登录邮箱")
+	status, payload, err := w.submitLoginEmail(ctx, email)
+	if err != nil {
+		return "", "", err
+	}
+	if status != http.StatusOK {
+		return "", "", fmt.Errorf("relogin email_submit_http_%d%s", status, registerResponseDetail(payload))
+	}
+	w.step("登录邮箱提交完成，开始密码校验")
+	headers := w.jsonHeaders(registerAuthBase + "/log-in/password")
+	token, tokenErr := w.buildSentinelToken(ctx, "password_verify")
+	if tokenErr != nil {
+		return "", "", tokenErr
+	}
+	headers["openai-sentinel-token"] = token
+	status, payload, err = w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/password/verify", map[string]any{
+		"password": password,
+	}, headers, false)
+	if err != nil {
+		return "", "", err
+	}
+	if status != http.StatusOK {
+		return "", "", fmt.Errorf("relogin password_verify_http_%d", status)
+	}
+	w.step("密码校验完成")
+	continueURL := util.Clean(payload["continue_url"])
+	page := util.StringMap(payload["page"])
+	if util.Clean(page["type"]) == "email_otp_verification" || strings.Contains(continueURL, "email-verification") || strings.Contains(continueURL, "email-otp") {
+		w.step("密码重登需要邮箱验证码，使用存量邮箱凭证收码")
+		code, waitErr := waitRegisterCode(ctx, w.mail, mailbox)
+		if waitErr != nil {
+			return "", "", waitErr
+		}
+		if code == "" {
+			return "", "", fmt.Errorf("relogin waiting for verification code timed out")
+		}
+		otpPayload, otpErr := w.validateOTPCode(ctx, code)
+		if otpErr != nil {
+			return "", "", otpErr
+		}
+		if next := util.Clean(otpPayload["continue_url"]); next != "" {
+			continueURL = next
+		}
+		w.step("登录验证码校验完成")
+	}
+	if continueURL == "" {
+		continueURL = flow.reauthorizeForSession()
+	}
+	callbackURL := ""
+	if continueURL != "" {
+		callbackURL, _ = flow.followRedirectChain(continueURL)
+	}
+	if callbackURL != "" {
+		flow.consumeCallback(callbackURL)
+	}
+	sessionToken, newAccessToken := flow.getAuthSession()
+	if newAccessToken == "" && callbackURL == "" && continueURL != "" {
+		if retry := flow.reauthorizeForSession(); retry != "" {
+			if cb, _ := flow.followRedirectChain(retry); cb != "" {
+				flow.consumeCallback(cb)
+			}
+			_, newAccessToken = flow.getAuthSession()
+		}
+	}
+	if newAccessToken == "" {
+		return "", "", fmt.Errorf("密码重登完成但未获取有效 access_token")
+	}
+	w.step("密码重登流程完成")
+	return newAccessToken, sessionToken, nil
+}
+
+// reloginMailbox rebuilds the mailbox map used to poll for the OTP from the
+// credentials stored at registration time. The CF temp-mail jwt (mail_token)
+// keeps the original inbox alive; without it a fresh mailbox is created with
+// the original address prefix (mail sent to the old address is then lost, but
+// resend still delivers to a freshly created same-prefix inbox on CF).
+func reloginMailbox(email string, creds map[string]any, mailConfig map[string]any) map[string]any {
+	mailbox := map[string]any{
+		"provider":     util.Clean(creds["mail_provider"]),
+		"provider_ref": util.Clean(creds["mail_ref"]),
+		"address":      email,
+		"token":        util.Clean(creds["mail_token"]),
+	}
+	if mailbox["token"] == "" {
+		localPart, _, _ := strings.Cut(email, "@")
+		rebuilt, err := createRegisterMailbox(mailConfig, localPart)
+		if err == nil {
+			return rebuilt
+		}
+	}
+	return mailbox
+}
 func newRegisterWorker(service *RegisterService, index int, config map[string]any) (*registerWorker, error) {
 	deviceID := util.NewUUID()
 	client, err := registerHTTPClient(util.Clean(config["proxy"]), 60*time.Second, deviceID)
@@ -396,11 +539,18 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	mailbox := result.Mailbox
+	if mailbox == nil {
+		mailbox = map[string]any{}
+	}
 	return map[string]any{
 		"email":         result.Email,
 		"password":      result.Password,
 		"access_token":  result.AccessToken,
 		"session_token": result.SessionToken,
+		"mail_provider": util.Clean(mailbox["provider"]),
+		"mail_ref":      util.Clean(mailbox["provider_ref"]),
+		"mail_token":    util.Clean(mailbox["token"]),
 		"created_at":    util.NowISO(),
 	}, nil
 }

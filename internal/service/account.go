@@ -73,6 +73,8 @@ type AccountService struct {
 	textCooldownUntil         time.Time
 	random                    *rand.Rand
 	refresher                 *SessionRefresher
+	reloginRunning            map[string]struct{}
+	reloginHook               func(accessToken, email, password string) error
 }
 
 const (
@@ -264,6 +266,109 @@ func (s *AccountService) AddAccounts(tokens []string) map[string]any {
 		"skipped":        skipped,
 	})
 	return map[string]any{"added": added, "skipped": skipped, "items": items}
+}
+
+// AddRegisteredAccount ingests a freshly registered account with every
+// credential the self-healing paths need: session_token for AT renewal,
+// password + email + mail credentials for the password-relogin fallback.
+func (s *AccountService) AddRegisteredAccount(result map[string]any) {
+	if s == nil {
+		return
+	}
+	accessToken := util.Clean(result["access_token"])
+	if accessToken == "" {
+		return
+	}
+	s.AddAccounts([]string{accessToken})
+	updates := map[string]any{}
+	if v := util.Clean(result["session_token"]); v != "" {
+		updates["session_token"] = v
+	}
+	if v := util.Clean(result["email"]); v != "" {
+		updates["email"] = v
+	}
+	if v := util.Clean(result["password"]); v != "" {
+		updates["password"] = v
+	}
+	if v := util.Clean(result["mail_provider"]); v != "" {
+		updates["mail_provider"] = v
+	}
+	if v := util.Clean(result["mail_ref"]); v != "" {
+		updates["mail_ref"] = v
+	}
+	if v := util.Clean(result["mail_token"]); v != "" {
+		updates["mail_token"] = v
+	}
+	if len(updates) == 0 {
+		return
+	}
+	updates["refresh_failures"] = 0
+	updates["refresh_next_at"] = nil
+	s.UpdateAccount(accessToken, updates)
+	s.logs.Add("注册账号入库（含自愈凭证）", map[string]any{
+		"module":         "accounts",
+		"operation_type": "新增",
+		"email":          util.Clean(result["email"]),
+		"has_session":    updates["session_token"] != "",
+		"has_password":   updates["password"] != "",
+		"has_mail":       updates["mail_token"] != "",
+	})
+}
+
+// refreshBackoffDelays are the consecutive-failure backoff windows applied
+// before an account is declared abnormal (in order, indexed by failures-1).
+var refreshBackoffDelays = []time.Duration{
+	1 * time.Minute,
+	5 * time.Minute,
+	30 * time.Minute,
+	2 * time.Hour,
+}
+
+const maxRefreshFailures = 4
+
+// refreshBackoffFor returns the retry delay for the nth consecutive failure
+// (1-based). Failures beyond the table keep the last delay.
+func refreshBackoffFor(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	if failures > len(refreshBackoffDelays) {
+		failures = len(refreshBackoffDelays)
+	}
+	return refreshBackoffDelays[failures-1]
+}
+
+// applyRefreshFailure records a failed session refresh: it keeps the account
+// in "过期待刷新" with a growing backoff window instead of immediately
+// marking it abnormal. After maxRefreshFailures consecutive failures the
+// account is escalated to "异常" (kept in the pool for password relogin).
+func (s *AccountService) applyRefreshFailure(accessToken, reason string) {
+	failures := 0
+	if account := s.GetAccount(accessToken); account != nil {
+		failures = util.ToInt(account["refresh_failures"], 0) + 1
+	}
+	nextAt := time.Now().Add(refreshBackoffFor(failures)).UTC().Format(time.RFC3339)
+	updates := map[string]any{
+		"refresh_failures": failures,
+		"refresh_next_at":  nextAt,
+	}
+	action := ""
+	if failures >= maxRefreshFailures {
+		updates["status"] = "异常"
+		action = "异常"
+	} else {
+		updates["status"] = "过期待刷新"
+	}
+	s.UpdateAccount(accessToken, updates)
+	s.logs.Add("session 刷新失败", map[string]any{
+		"module":         "accounts",
+		"operation_type": "刷新",
+		"token":          util.AnonymizeToken(accessToken),
+		"failures":       failures,
+		"next_retry_at":  nextAt,
+		"escalated":      action == "异常",
+		"reason":         reason,
+	})
 }
 
 func (s *AccountService) AddAccountFromSession(sessionJSON string) (map[string]any, error) {
@@ -649,7 +754,11 @@ func (s *AccountService) refreshAccountViaSessionAsync(accessToken, sessionToken
 
 		newAccessToken, newSessionToken, newExpires, err := s.refresher.RefreshToken(ctx, accessToken, sessionToken)
 		if err != nil {
-			s.UpdateAccount(accessToken, map[string]any{"status": "异常"})
+			if s.sessionRejectedError(err) {
+				s.triggerRelogin(accessToken, err.Error())
+				return
+			}
+			s.applyRefreshFailure(accessToken, err.Error())
 			return
 		}
 		s.RefreshAccountViaSession(accessToken, newAccessToken, newSessionToken, newExpires)
@@ -1066,7 +1175,11 @@ func (s *AccountService) RefreshAccounts(ctx context.Context, accessTokens []str
 		detail := detailsByToken[item.accessToken]
 		newAccessToken, newSessionToken, newExpires, err := s.refresher.RefreshToken(ctx, item.accessToken, item.sessionToken)
 		if err != nil {
-			s.UpdateAccount(item.accessToken, map[string]any{"status": "异常"})
+			if s.sessionRejectedError(err) {
+				s.triggerRelogin(item.accessToken, err.Error())
+			} else {
+				s.applyRefreshFailure(item.accessToken, err.Error())
+			}
 			failedRefreshCount++
 			message := fmt.Sprintf("token刷新失败: %s", err.Error())
 			errors = append(errors, map[string]string{
@@ -1078,7 +1191,9 @@ func (s *AccountService) RefreshAccounts(ctx context.Context, accessTokens []str
 				detail["status"] = "error"
 				detail["message"] = message
 				detail["error"] = message
-				detail["account_status"] = "异常"
+				if current := s.GetAccount(item.accessToken); current != nil {
+					detail["account_status"] = current["status"]
+				}
 			}
 			continue
 		}
@@ -1283,10 +1398,12 @@ func (s *AccountService) RefreshAccountViaSession(accessToken, newAccessToken, n
 	}
 
 	account := normalizeAccount(mergeMaps(s.items[idx], map[string]any{
-		"access_token":    newAccessToken,
-		"session_token":   newSessionToken,
-		"session_expires": newExpires,
-		"status":          "正常",
+		"access_token":     newAccessToken,
+		"session_token":    newSessionToken,
+		"session_expires":  newExpires,
+		"status":           "正常",
+		"refresh_failures": 0,
+		"refresh_next_at":  nil,
 	}))
 	if account == nil {
 		return false
@@ -1627,6 +1744,7 @@ func (s *AccountService) StartLimitedWatcher(ctx context.Context, interval time.
 				return
 			case <-timer.C:
 				tokens := s.listRefreshableLimitedTokens(time.Now())
+				tokens = append(tokens, s.listPendingRefreshTokens(time.Now())...)
 				if len(tokens) > 0 {
 					s.RefreshAccounts(ctx, tokens)
 				}
@@ -1634,6 +1752,303 @@ func (s *AccountService) StartLimitedWatcher(ctx context.Context, interval time.
 			}
 		}
 	}()
+}
+
+// StartSessionRefreshWatcher proactively renews access tokens before they
+// expire, so live requests never hit a 401. Every interval it scans the pool
+// for accounts whose access-token JWT expires within the proactive window and
+// that carry a session_token, then refreshes them serially.
+func (s *AccountService) StartSessionRefreshWatcher(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				for _, token := range s.listExpiringTokens(time.Now(), sessionProactiveWindow) {
+					if ctx.Err() != nil {
+						return
+					}
+					s.renewAccountAccessToken(ctx, token)
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+}
+
+// sessionProactiveWindow renews tokens expiring within the next hour.
+const sessionProactiveWindow = time.Hour
+
+// accessTokenExpiresAt parses the JWT exp claim of an access token.
+// Tokens that are not JWTs or lack exp return (zero, false) and are skipped
+// by the proactive watcher (the reactive paths still cover them).
+func accessTokenExpiresAt(token string) (time.Time, bool) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 2 && len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Exp, 0), true
+}
+
+// listExpiringTokens returns schedulable accounts whose access token expires
+// within window and that have a session_token to renew with.
+func (s *AccountService) listExpiringTokens(now time.Time, window time.Duration) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0)
+	for _, item := range s.items {
+		if !accountEnabledValue(item) {
+			continue
+		}
+		status := util.Clean(item["status"])
+		if status != "正常" && status != "过期待刷新" {
+			continue
+		}
+		sessionToken := util.Clean(item["session_token"])
+		if sessionToken == "" {
+			continue
+		}
+		if status == "过期待刷新" {
+			// Already queued via the pending-refresh path in StartLimitedWatcher.
+			continue
+		}
+		expiresAt, ok := accessTokenExpiresAt(util.Clean(item["access_token"]))
+		if !ok {
+			continue
+		}
+		if expiresAt.Sub(now) > window {
+			continue
+		}
+		out = append(out, util.Clean(item["access_token"]))
+	}
+	return out
+}
+
+// listPendingRefreshTokens returns "过期待刷新" accounts whose backoff window
+// has elapsed, so the limited watcher retries them.
+func (s *AccountService) listPendingRefreshTokens(now time.Time) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0)
+	for _, item := range s.items {
+		if !accountEnabledValue(item) || util.Clean(item["status"]) != "过期待刷新" {
+			continue
+		}
+		if util.Clean(item["session_token"]) == "" {
+			continue
+		}
+		if nextAt, ok := parseAccountRestoreAt(item["refresh_next_at"]); ok && nextAt.After(now) {
+			continue
+		}
+		if token := util.Clean(item["access_token"]); token != "" {
+			out = append(out, token)
+		}
+	}
+	return out
+}
+
+// renewAccountAccessToken silently refreshes one account's access token via
+// the session endpoint and logs the outcome.
+func (s *AccountService) renewAccountAccessToken(ctx context.Context, accessToken string) {
+	account := s.GetAccount(accessToken)
+	if account == nil {
+		return
+	}
+	sessionToken := util.Clean(account["session_token"])
+	if sessionToken == "" || s.refresher.IsRefreshing(accessToken) {
+		return
+	}
+	newAccessToken, newSessionToken, newExpires, err := s.refresher.RefreshToken(ctx, accessToken, sessionToken)
+	if err != nil {
+		if s.sessionRejectedError(err) {
+			s.triggerRelogin(accessToken, err.Error())
+		} else {
+			s.applyRefreshFailure(accessToken, err.Error())
+		}
+		return
+	}
+	if s.RefreshAccountViaSession(accessToken, newAccessToken, newSessionToken, newExpires) {
+		s.logs.Add("AT 已自动续期", map[string]any{
+			"module":         "accounts",
+			"operation_type": "刷新",
+			"token":          util.AnonymizeToken(accessToken),
+			"expires":        newExpires,
+		})
+	}
+}
+
+// sessionRejectedError reports whether the session endpoint explicitly
+// rejected the session cookie (as opposed to a network/CF failure). Only
+// these errors justify falling back to password relogin.
+func (s *AccountService) sessionRejectedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	if !strings.Contains(text, "session endpoint returned") {
+		return false
+	}
+	// 401/403 mean the session cookie is invalid; 5xx/429 are transient.
+	for _, code := range []string{" 401", " 403"} {
+		if strings.Contains(text, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// triggerRelogin schedules a password-relogin fallback for an account whose
+// session can no longer be refreshed. One relogin at a time per account.
+func (s *AccountService) triggerRelogin(accessToken, reason string) {
+	account := s.GetAccount(accessToken)
+	if account == nil {
+		return
+	}
+	creds := map[string]any{
+		"email":         util.Clean(account["email"]),
+		"password":      util.Clean(account["password"]),
+		"mail_provider": util.Clean(account["mail_provider"]),
+		"mail_ref":      util.Clean(account["mail_ref"]),
+		"mail_token":    util.Clean(account["mail_token"]),
+	}
+	if util.Clean(creds["email"]) == "" || util.Clean(creds["password"]) == "" {
+		// No credentials for relogin — escalate via the backoff path.
+		s.applyRefreshFailure(accessToken, "session 失效且无重登凭证: "+reason)
+		return
+	}
+	if !s.markReloginPending(accessToken) {
+		return
+	}
+	s.logs.Add("session 失效，提交密码重登", map[string]any{
+		"module":         "accounts",
+		"operation_type": "刷新",
+		"token":          util.AnonymizeToken(accessToken),
+		"email":          creds["email"],
+		"reason":         reason,
+	})
+	go s.runRelogin(accessToken, creds)
+}
+
+// markReloginPending flips the account to "刷新中" unless a relogin is
+// already in flight (tracked via reloginRunning set).
+func (s *AccountService) markReloginPending(accessToken string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := s.findIndexLocked(accessToken)
+	if idx < 0 {
+		return false
+	}
+	if s.reloginRunning == nil {
+		s.reloginRunning = map[string]struct{}{}
+	}
+	if _, ok := s.reloginRunning[accessToken]; ok {
+		return false
+	}
+	s.reloginRunning[accessToken] = struct{}{}
+	s.items[idx]["status"] = "刷新中"
+	_ = s.saveLocked()
+	return true
+}
+
+func (s *AccountService) finishRelogin(accessToken string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.reloginRunning, accessToken)
+}
+
+// SetReloginHook registers the password-relogin implementation. The hook is
+// owned by RegisterService, which holds the mail configuration and the
+// register worker builder; creds carries email/password plus the stored mail
+// credentials (mail_provider/mail_ref/mail_token) needed to rebuild the
+// mailbox for OTP retrieval. It returns the renewed (access_token,
+// session_token) pair on success.
+func (s *AccountService) SetReloginHook(hook func(accessToken string, creds map[string]any) (string, string, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reloginHook = hook
+}
+
+// runRelogin performs the password-relogin fallback: it delegates to the
+// registered hook and either rotates the stored tokens back into the pool or
+// schedules a retry (three consecutive failures remove the account).
+func (s *AccountService) runRelogin(accessToken string, creds map[string]any) {
+	defer s.finishRelogin(accessToken)
+	s.mu.Lock()
+	hook := s.reloginHook
+	s.mu.Unlock()
+	if hook == nil {
+		s.applyRefreshFailure(accessToken, "密码重登未配置（注册服务未就绪）")
+		return
+	}
+	newAccessToken, newSessionToken, err := hook(accessToken, creds)
+	if err != nil {
+		s.applyReloginFailure(accessToken, err.Error())
+		return
+	}
+	if newAccessToken == "" {
+		s.applyReloginFailure(accessToken, "密码重登未返回 access_token")
+		return
+	}
+	if s.RefreshAccountViaSession(accessToken, newAccessToken, newSessionToken, "") {
+		s.UpdateAccount(newAccessToken, map[string]any{"relogin_failures": 0})
+		s.logs.Add("密码重登成功", map[string]any{
+			"module":         "accounts",
+			"operation_type": "刷新",
+			"token":          util.AnonymizeToken(newAccessToken),
+			"email":          util.Clean(creds["email"]),
+		})
+	}
+}
+
+// applyReloginFailure records a failed password relogin: the account stays in
+// the pool with a backoff window (the limited watcher retries the session
+// refresh, which re-triggers relogin), and after maxReloginFailures
+// consecutive failures the account is removed.
+func (s *AccountService) applyReloginFailure(accessToken, reason string) {
+	failures := 0
+	if account := s.GetAccount(accessToken); account != nil {
+		failures = util.ToInt(account["relogin_failures"], 0) + 1
+	}
+	if failures >= maxReloginFailures {
+		if s.RemoveToken(accessToken) {
+			s.logs.Add("密码重登连续失败，移除账号", map[string]any{
+				"module":         "accounts",
+				"operation_type": "删除",
+				"token":          util.AnonymizeToken(accessToken),
+				"reason":         reason,
+			})
+		}
+		return
+	}
+	nextAt := time.Now().Add(refreshBackoffFor(failures)).UTC().Format(time.RFC3339)
+	s.UpdateAccount(accessToken, map[string]any{
+		"relogin_failures": failures,
+		"refresh_failures": 0,
+		"refresh_next_at":  nextAt,
+		"status":           "过期待刷新",
+	})
+	s.logs.Add(fmt.Sprintf("密码重登失败(第 %d 次)，稍后重试", failures), map[string]any{
+		"module":         "accounts",
+		"operation_type": "刷新",
+		"token":          util.AnonymizeToken(accessToken),
+		"reason":         reason,
+	})
 }
 
 type imageTokenReservation struct {
