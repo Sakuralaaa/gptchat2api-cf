@@ -113,7 +113,6 @@ func (r *AccountRecovery) startOne(email string) error {
 	page := util.StringMap(payload["page"])
 	pageType := util.Clean(page["type"])
 	continueURL := util.Clean(payload["continue_url"])
-	otpSentAt := time.Now().Add(-8 * time.Second)
 	if pageType == "create_account_password" || strings.Contains(continueURL, "/create-account/password") {
 		worker.close()
 		return fmt.Errorf("该账号设置了密码，请用「密码重登」或手动 Session JSON 导入")
@@ -125,7 +124,6 @@ func (r *AccountRecovery) startOne(email string) error {
 			worker.close()
 			return fmt.Errorf("上游未返回验证码挑战（page_type=%s）", pageType)
 		}
-		otpSentAt = time.Now()
 	}
 
 	mailConfig := util.StringMap(config["mail"])
@@ -263,7 +261,7 @@ func (r *AccountRecovery) ConfirmRecovery(email, code string) (map[string]any, e
 	r.dropPending(email)
 	session.worker.close()
 	session.worker.step("账号找回成功: " + session.email)
-	return result, nil
+	return map[string]any{"access_token": result}, nil
 }
 
 func (r *AccountRecovery) dropPending(email string) {
