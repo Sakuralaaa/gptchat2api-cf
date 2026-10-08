@@ -4,8 +4,6 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowRight,
-  Github,
-  Send,
   KeyRound,
   LoaderCircle,
   MoonStar,
@@ -34,8 +32,6 @@ import { getDefaultRouteForSession } from "@/store/auth";
 
 const loginBackgroundClass =
   "bg-[#fff9fb] bg-[radial-gradient(rgba(20,86,240,0.12)_1px,transparent_1px),linear-gradient(145deg,#fff8fa_0%,#ffffff_48%,#f4f8ff_100%)] [background-position:0_0,center] [background-size:12px_12px,cover] dark:bg-[#090d16] dark:bg-[radial-gradient(rgba(96,165,250,0.16)_1px,transparent_1px),linear-gradient(145deg,#080b13_0%,#101827_52%,#070b12_100%)]";
-const githubUrl = "https://github.com/ZyphrZero/chatgpt2api";
-const telegramUrl = "https://t.me/+YBR7t_CPOYBkYzU1";
 
 export default function LoginPage() {
   const navigate = useNavigate();
@@ -131,28 +127,6 @@ export default function LoginPage() {
       className={`${loginBackgroundClass} fixed inset-0 z-50 flex min-h-svh w-screen items-center justify-center overflow-y-auto px-4 py-6 font-login [align-items:safe_center] sm:px-6 lg:px-8`}
     >
       <div className="fixed right-4 top-4 z-50 flex items-center gap-2 sm:right-6 sm:top-6">
-        <Button
-          asChild
-          type="button"
-          variant="outline"
-          className="h-9 rounded-full border-border/60 bg-background/80 px-3 text-muted-foreground shadow-sm backdrop-blur hover:text-foreground"
-        >
-          <a href={telegramUrl} target="_blank" rel="noreferrer" aria-label="加入 Telegram 群组">
-            <Send data-icon="inline-start" />
-            <span className="hidden sm:inline">Telegram</span>
-          </a>
-        </Button>
-        <Button
-          asChild
-          type="button"
-          variant="outline"
-          className="h-9 rounded-full border-border/60 bg-background/80 px-3 text-muted-foreground shadow-sm backdrop-blur hover:text-foreground"
-        >
-          <a href={githubUrl} target="_blank" rel="noreferrer" aria-label="打开 GitHub 仓库">
-            <Github data-icon="inline-start" />
-            <span className="hidden sm:inline">GitHub</span>
-          </a>
-        </Button>
         <Button
           ref={themeToggleRef}
           type="button"

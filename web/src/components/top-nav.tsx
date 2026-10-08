@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronDown, ChevronUp, Github, LogOut, MoonStar, Send, Sun, UserCircle2 } from "lucide-react";
+import { ChevronDown, ChevronUp, LogOut, MoonStar, Sun, UserCircle2 } from "lucide-react";
 import { motion, useReducedMotion, type Transition } from "motion/react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 
@@ -223,26 +223,6 @@ function AccountMenu({
               <UserCircle2 className="size-4" />
               个人中心
             </Link>
-            <a
-              href="https://t.me/+YBR7t_CPOYBkYzU1"
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
-              onClick={() => setOpen(false)}
-            >
-              <Send className="size-4" />
-              Telegram
-            </a>
-            <a
-              href="https://github.com/ZyphrZero/chatgpt2api"
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
-              onClick={() => setOpen(false)}
-            >
-              <Github className="size-4" />
-              GitHub
-            </a>
           </div>
 
           <button
