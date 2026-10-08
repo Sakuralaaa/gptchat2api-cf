@@ -545,8 +545,7 @@ const settingsDocName = "settings.json"
 func (s *Store) loadPersistentSettings() {
 	backend, err := storage.NewBackendFromEnv(s.DataDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: settings persistence disabled, storage backend unavailable: %v
-", err)
+		fmt.Fprintf(os.Stderr, "Warning: settings persistence disabled, storage backend unavailable: %v\n", err)
 		return
 	}
 	s.storageBackend = backend
@@ -576,8 +575,7 @@ func (s *Store) savePersistentSettingsLocked() {
 		return
 	}
 	if err := s.storageBackend.SaveJSONDocument(settingsDocName, util.CopyMap(s.data)); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to persist settings: %v
-", err)
+		fmt.Fprintf(os.Stderr, "Warning: failed to persist settings: %v\n", err)
 	}
 }
 
