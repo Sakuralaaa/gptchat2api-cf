@@ -81,6 +81,7 @@ func NewStore() (*Store, error) {
 	}
 	s.loadEnvFile()
 	s.data = settingsFromEnvValues(envFileValues)
+	s.loadPersistentSettings()
 	return s, nil
 }
 
@@ -521,6 +522,7 @@ func (s *Store) saveLocked() error {
 	for key, value := range updates {
 		_ = os.Setenv(key, value)
 	}
+	s.savePersistentSettingsLocked()
 	return nil
 }
 
@@ -531,6 +533,54 @@ func (s *Store) loadEnvFile() {
 		}
 	}
 }
+
+// settingsDocName is the JSON document used to persist UI-managed settings.
+const settingsDocName = "settings.json"
+
+// loadPersistentSettings restores settings saved by a previous run from the
+// storage backend. The .env file lives on the container filesystem and is
+// lost on image updates, while the database sits on a persistent volume.
+// Values explicitly configured through real environment variables (e.g. set
+// in the Zeabur console) keep priority over stored ones.
+func (s *Store) loadPersistentSettings() {
+	backend, err := storage.NewBackendFromEnv(s.DataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: settings persistence disabled, storage backend unavailable: %v
+", err)
+		return
+	}
+	s.storageBackend = backend
+	doc, err := backend.LoadJSONDocument(settingsDocName)
+	if err != nil || doc == nil {
+		return
+	}
+	stored, ok := doc.(map[string]any)
+	if !ok {
+		return
+	}
+	for key, value := range stored {
+		if envKey := settingEnvKeys[key]; envKey != "" {
+			if _, set := os.LookupEnv(envKey); set {
+				continue
+			}
+		}
+		s.data[key] = value
+	}
+}
+
+// savePersistentSettingsLocked mirrors the current settings into the
+// storage backend; failures are logged but do not block the .env write.
+// Callers must hold s.mu.
+func (s *Store) savePersistentSettingsLocked() {
+	if s.storageBackend == nil {
+		return
+	}
+	if err := s.storageBackend.SaveJSONDocument(settingsDocName, util.CopyMap(s.data)); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to persist settings: %v
+", err)
+	}
+}
+
 
 func settingsFromEnvValues(values map[string]string) map[string]any {
 	settings := map[string]any{}

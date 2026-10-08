@@ -66,6 +66,7 @@ var apiPermissionCatalog = []APIPermission{
 	apiPermission("POST", "/api/accounts/recover", "邮箱找回存量账号（发起）", "号池管理", false),
 	apiPermission("POST", "/api/accounts/recover/confirm", "邮箱找回存量账号（验证码确认）", "号池管理", false),
 	apiPermission("POST", "/api/accounts/recover/cancel", "取消邮箱找回会话", "号池管理", false),
+	apiPermission("POST", "/api/accounts/recover/fetch-code", "自动读取找回验证码", "号池管理", false),
 	apiPermission("POST", "/api/accounts/refresh", "刷新号池", "号池管理", false),
 	apiPermission("POST", "/api/accounts/upstream-actions", "执行上游账号操作", "号池管理", false),
 	apiPermission("POST", "/api/accounts/update", "编辑号池账号", "号池管理", false),

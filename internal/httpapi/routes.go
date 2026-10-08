@@ -1155,6 +1155,23 @@ func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		body, _ := readJSONMap(r)
 		a.recovery.CancelRecovery(util.Clean(body["email"]))
 		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	case r.URL.Path == "/api/accounts/recover/fetch-code" && r.Method == http.MethodPost:
+		body, err := readJSONMap(r)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, "invalid json body")
+			return
+		}
+		email := util.Clean(body["email"])
+		if email == "" {
+			util.WriteError(w, http.StatusBadRequest, "email is required")
+			return
+		}
+		code, err := a.recovery.FetchRecoveryCode(email)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": code != "", "otp": code})
 	case r.URL.Path == "/api/accounts" && r.Method == http.MethodDelete:
 		body, _ := readJSONMap(r)
 		tokens := util.AsStringSlice(body["tokens"])

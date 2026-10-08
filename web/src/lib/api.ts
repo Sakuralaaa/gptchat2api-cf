@@ -920,6 +920,13 @@ export async function confirmAccountRecovery(email: string, otp: string) {
   });
 }
 
+export async function fetchRecoveryCodeOtp(email: string) {
+  return httpRequest<{ ok: boolean; otp: string }>("/api/accounts/recover/fetch-code", {
+    method: "POST",
+    body: { email },
+  });
+}
+
 export async function cancelAccountRecovery(email: string) {
   return httpRequest<{ ok: boolean }>("/api/accounts/recover/cancel", {
     method: "POST",

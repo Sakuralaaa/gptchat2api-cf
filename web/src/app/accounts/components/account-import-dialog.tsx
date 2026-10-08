@@ -28,7 +28,7 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
-import { cancelAccountRecovery, confirmAccountRecovery, createAccountFromSession, createAccounts, startAccountRecovery, type Account } from "@/lib/api";
+import { cancelAccountRecovery, confirmAccountRecovery, createAccountFromSession, createAccounts, fetchRecoveryCodeOtp, startAccountRecovery, type Account } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type ImportMethod = "menu" | "token" | "session" | "cpa" | "recover";
@@ -321,6 +321,25 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
     }
   };
 
+  const autoFetchOtp = async () => {
+    if (recoverPending.length === 0) {
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const data = await fetchRecoveryCodeOtp(recoverPending[0]);
+      if (data.ok && data.otp) {
+        setRecoverOtp(data.otp);
+        toast.success("已自动读取验证码");
+      } else {
+        toast.error("邮箱里还没有新邮件，稍后再试或手动填入");
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "自动读取验证码失败（未配置 CF 邮箱管理凭证时可手动填入）");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
   const confirmRecovery = async () => {
     if (recoverPending.length === 0) {
       toast.error("请先发起找回");
@@ -553,7 +572,17 @@ export function AccountImportDialog({ disabled, canImportTokens, canImportSessio
                   inputMode="numeric"
                   maxLength={6}
                 />
-                <div className="text-xs text-stone-500">本次找回邮箱：{recoverPending.join("、")}</div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="rounded-xl border-stone-200 bg-white"
+                  onClick={() => void autoFetchOtp()}
+                  disabled={isSubmitting}
+                >
+                  {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                  自动获取验证码
+                </Button>
+                <div className="text-xs text-stone-500">需在注册机设置中启用同一 CF 临时邮箱服务（含 admin 凭证）；否则请在邮箱后台手动查看并填入。</div>
               </div>
             </>
           )}

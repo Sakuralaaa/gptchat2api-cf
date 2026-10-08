@@ -190,8 +190,9 @@ func recoveryAutoOTPAvailable(mailConfig map[string]any, email string) bool {
 	return false
 }
 
-// FetchRecoveryCode tries to pull the newest OTP from the CF temp-mail admin
-// API for the given address. It returns "" when the mailbox has no new mail.
+// FetchRecoveryCode pulls the newest OTP for the address through the CF
+// temp-mail admin API (x-admin-auth), polling until a code shows up or
+// ~60 seconds elapse. Returns "" when no code arrived in time.
 func (r *AccountRecovery) FetchRecoveryCode(email string) (string, error) {
 	r.mu.Lock()
 	session := r.pending[strings.ToLower(strings.TrimSpace(email))]
@@ -199,26 +200,86 @@ func (r *AccountRecovery) FetchRecoveryCode(email string) (string, error) {
 	if session == nil {
 		return "", fmt.Errorf("该邮箱没有进行中的找回会话")
 	}
-	local, _, _ := strings.Cut(session.email, "@")
-	mailbox := map[string]any{"address": session.email, "token": ""}
-	_ = local
-	code := ""
+	entries, err := recoveryAdminMailEntries(session.mailConfig, session.email)
+	if err != nil {
+		return "", err
+	}
+	if len(entries) == 0 {
+		return "", fmt.Errorf("没有可用的 CF 临时邮箱管理凭证（admin_password）")
+	}
 	for attempt := 0; attempt < 20; attempt++ {
-		provider, err := createRegisterMailProvider(session.mailConfig, "cloudflare_temp_email", "")
-		if err != nil {
-			return "", err
-		}
-		message, fetchErr := provider.FetchLatestMessage(mailbox)
-		provider.Close()
-		if fetchErr == nil && message != nil {
-			if got := extractRegisterMailCode(message); got != "" {
-				code = got
-				break
+		for _, entry := range entries {
+			message, fetchErr := fetchAdminMailMessage(entry, session.email)
+			if fetchErr == nil && message != nil {
+				if code := extractRegisterMailCode(message); code != "" {
+					return code, nil
+				}
 			}
 		}
 		time.Sleep(3 * time.Second)
 	}
-	return code, nil
+	return "", nil
+}
+
+// recoveryAdminMailEntries returns the enabled cloudflare_temp_email
+// provider entries (with admin_password) whose domain list covers the
+// address, so the admin API can be used to read its inbox.
+func recoveryAdminMailEntries(mailConfig map[string]any, email string) ([]map[string]any, error) {
+	_, domain, ok := strings.Cut(strings.ToLower(email), "@")
+	if !ok || domain == "" {
+		return nil, fmt.Errorf("无效邮箱地址")
+	}
+	out := make([]map[string]any, 0)
+	for _, entry := range util.AsMapSlice(mailConfig["providers"]) {
+		if !util.ToBool(entry["enable"]) || util.Clean(entry["type"]) != "cloudflare_temp_email" {
+			continue
+		}
+		if util.Clean(entry["admin_password"]) == "" || util.Clean(entry["api_base"]) == "" {
+			continue
+		}
+		for _, d := range util.AsStringSlice(entry["domain"]) {
+			if strings.EqualFold(strings.TrimSpace(d), domain) {
+				out = append(out, util.CopyMap(entry))
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// fetchAdminMailMessage reads the newest message for an address through the
+// cloudflare_temp_email admin API and normalizes it for code extraction.
+func fetchAdminMailMessage(entry map[string]any, email string) (map[string]any, error) {
+	apiBase := strings.TrimRight(util.Clean(entry["api_base"]), "/")
+	client := registerMailHTTPClient(15 * time.Second)
+	defer client.CloseIdleConnections()
+	data, err := registerMailRequestJSON(client, "GET", apiBase+"/admin/mails", map[string]string{
+		"x-admin-auth": util.Clean(entry["admin_password"]),
+		"User-Agent":   "Mozilla/5.0",
+		"Accept":       "application/json",
+	}, map[string]string{
+		"address": email,
+		"limit":   "5",
+		"offset":  "0",
+	}, nil, 200)
+	if err != nil {
+		return nil, err
+	}
+	items := util.AsMapSlice(data["results"])
+	if len(items) == 0 {
+		// Some deployments return a bare array.
+		items = util.AsMapSlice(data["raw"])
+		if len(items) == 0 {
+			return nil, nil
+		}
+	}
+	latest := items[0]
+	return map[string]any{
+		"subject":      util.Clean(latest["subject"]),
+		"text_content": registerContentString(latest["text"]) + registerContentString(latest["content"]),
+		"html_content": registerContentString(latest["html"]) + registerContentString(latest["message"]),
+		"raw":          util.Clean(latest["raw"]),
+	}, nil
 }
 
 // ConfirmRecovery validates the code (user-pasted or auto-fetched) and
