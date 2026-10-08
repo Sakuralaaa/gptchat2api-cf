@@ -52,7 +52,10 @@ func NewAccountRecovery(accounts *AccountService, register *RegisterService) *Ac
 func (r *AccountRecovery) StartRecovery(emails []string) (started map[string]bool, errors map[string]string) {
 	started = map[string]bool{}
 	errors = map[string]string{}
-	for _, email := range emails {
+	for i, email := range emails {
+		if i > 0 {
+			time.Sleep(5 * time.Second)
+		}
 		email = strings.ToLower(strings.TrimSpace(email))
 		if email == "" || !strings.Contains(email, "@") {
 			errors[email] = "无效邮箱地址"
@@ -98,36 +101,55 @@ func (r *AccountRecovery) startOne(email string) error {
 		worker.close()
 		return fmt.Errorf("authorize 初始化失败: %w", err)
 	}
-	// Existing-account branch: submit the email without a screen hint so the
-	// upstream answers with the passwordless challenge and (for
-	// passwordless_login accounts) automatically dispatches the code.
-	status, payload, err := worker.submitLoginEmail(ctx, email)
-	if err != nil {
-		worker.close()
-		return fmt.Errorf("提交邮箱失败: %w", err)
+	// Mirror the register link: submit the email through the flow's
+	// authorize/continue (sentinel token), retrying transient upstream
+	// 409/429 responses exactly like the register flow does.
+	var isNew bool
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(15*attempt) * time.Second
+			worker.step(fmt.Sprintf("上游限流/冲突，%s 后重试(%d/3)", delay, attempt+1))
+			time.Sleep(delay)
+		}
+		isNew, lastErr = flow.signup(email)
+		if lastErr == nil {
+			break
+		}
+		if !strings.Contains(lastErr.Error(), "HTTP 429") && !strings.Contains(lastErr.Error(), "HTTP 409") {
+			break
+		}
 	}
-	if status != http.StatusOK {
+	if lastErr != nil {
 		worker.close()
-		return fmt.Errorf("提交邮箱 HTTP %d%s", status, registerResponseDetail(payload))
+		return fmt.Errorf("提交邮箱失败: %w", lastErr)
 	}
-	page := util.StringMap(payload["page"])
-	pageType := util.Clean(page["type"])
-	continueURL := util.Clean(payload["continue_url"])
-	if pageType == "create_account_password" || strings.Contains(continueURL, "/create-account/password") {
+	if isNew {
 		worker.close()
-		return fmt.Errorf("该账号设置了密码，请用「密码重登」或手动 Session JSON 导入")
+		return fmt.Errorf("该邮箱未注册过 ChatGPT 账号（上游返回了注册页）")
 	}
-	if pageType != "email_otp_verification" && !strings.Contains(continueURL, "email-verification") && !strings.Contains(continueURL, "email-otp") {
-		// Non-standard response: try to force the code via the existing-account
-		// send path before giving up.
-		if err := flow.sendOTP(registerAuthBase + "/email-verification"); err != nil {
+	// The login page answers with the password challenge for accounts that
+	// carry a password (legacy registrations always did). Switch to the
+	// one-time email code login — the "使用邮箱验证码登录" option — via the
+	// passwordless send-otp endpoint, then wait for the code as usual.
+	pageType := flow.existingPageType
+	mode := strings.ToLower(flow.existingVerificationMode)
+	if pageType == "login_password" || strings.Contains(pageType, "password") {
+		worker.step("上游要求密码登录，切换为邮箱验证码登录")
+		if !flow.sendPasswordlessOTP(registerAuthBase + "/log-in/password") {
 			worker.close()
-			return fmt.Errorf("上游未返回验证码挑战（page_type=%s）", pageType)
+			return fmt.Errorf("切换邮箱验证码登录失败（passwordless/send-otp）")
+		}
+	} else if mode != "passwordless_login" && mode != "passwordless_signup" {
+		// Existing-account OTP challenge without an auto-dispatched code.
+		if err := flow.sendOTP(registerAuthBase + "/email-verification"); err != nil {
+			if !flow.resendOTP(registerAuthBase + "/email-verification") {
+				worker.close()
+				return fmt.Errorf("发送验证码失败: %w", err)
+			}
 		}
 	}
 
-	mailConfig := util.StringMap(config["mail"])
-	autoOTP := recoveryAutoOTPAvailable(mailConfig, email)
 	r.mu.Lock()
 	if old := r.pending[email]; old != nil {
 		old.worker.close()
@@ -137,8 +159,8 @@ func (r *AccountRecovery) startOne(email string) error {
 		flow:       flow,
 		email:      email,
 		createdAt:  time.Now(),
-		autoOTP:    autoOTP,
-		mailConfig: mailConfig,
+		autoOTP:    recoveryAutoOTPAvailable(util.StringMap(config["mail"]), email),
+		mailConfig: util.StringMap(config["mail"]),
 	}
 	r.mu.Unlock()
 	worker.step(fmt.Sprintf("找回登录已发起，验证码已发送到 %s", email))
