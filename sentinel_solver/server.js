@@ -19,6 +19,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
+const { spawn } = require('child_process');
 
 const CHATGPT_URL = process.env.SENTINEL_SOLVER_TARGET || 'https://chatgpt.com/';
 const CHALLENGE_TITLES = ['请稍候', 'Just a moment', 'Attention Required'];
@@ -46,6 +47,8 @@ const TIMEZONE = (process.env.SENTINEL_SOLVER_TIMEZONE || '').trim();
 
 const LOCALE = (process.env.SENTINEL_SOLVER_LOCALE || 'en-US').trim();
 const PROXY_OPTIONS = proxyOptionsFromURL(PROXY);
+const LOCAL_PROXY_PORT = parseInt(process.env.SENTINEL_SOLVER_LOCAL_PROXY_PORT || '1080', 10) || 1080;
+const LOCAL_PROXY_OPTIONS = needsLocalProxy(PROXY_OPTIONS) ? { server: `socks5://127.0.0.1:${LOCAL_PROXY_PORT}` } : null;
 
 /** 把 http(s)/socks 代理 URL 拆成 playwright 的 {server, username, password}。 */
 function proxyOptionsFromURL(raw) {
@@ -61,6 +64,59 @@ function proxyOptionsFromURL(raw) {
     console.log('[sentinel-solver] invalid SENTINEL_SOLVER_PROXY, using the raw value');
     return { server: value };
   }
+}
+
+/** Chromium 不能为 SOCKS5 上游做代理认证，这类上游必须在本机先转发一层。 */
+function needsLocalProxy(options) {
+  if (!options) return false;
+  if (!/^socks/i.test(String(options.server || ''))) return false;
+  return Boolean(options.username || options.password);
+}
+
+let localProxyProcess = null;
+
+function waitForLocalProxy(port, timeoutMs) {
+  const net = require('net');
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const socket = net.connect(port, '127.0.0.1');
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve();
+      });
+      socket.once('error', () => {
+        socket.destroy();
+        if (Date.now() > deadline) {
+          reject(new Error(`local proxy 127.0.0.1:${port} not ready`));
+          return;
+        }
+        setTimeout(attempt, 300);
+      });
+    };
+    attempt();
+  });
+}
+
+/** 用 gost 把带认证的 SOCKS5 上游转发成本机无认证的 SOCKS5（Chromium 只连本机端口）。 */
+async function startLocalProxy() {
+  if (!LOCAL_PROXY_OPTIONS || localProxyProcess) return;
+  const child = spawn('gost', ['-L', LOCAL_PROXY_OPTIONS.server, '-F', PROXY], { stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stdout.on('data', (chunk) => log('gost:', String(chunk).trim()));
+  child.stderr.on('data', (chunk) => log('gost:', String(chunk).trim()));
+  child.on('exit', (code) => {
+    log('gost exited with code', code);
+    localProxyProcess = null;
+  });
+  localProxyProcess = child;
+  await waitForLocalProxy(LOCAL_PROXY_PORT, 15000);
+  log(`local auth-free socks5 ready on 127.0.0.1:${LOCAL_PROXY_PORT}`);
+}
+
+function stopLocalProxy() {
+  if (!localProxyProcess) return;
+  try { localProxyProcess.kill('SIGTERM'); } catch (err) { /* ignore */ }
+  localProxyProcess = null;
 }
 
 /** 从真实页面读取时区/偏移/locale；偏移值随夏令时变化，不能写死。 */
@@ -142,7 +198,8 @@ class SolverPage {
       channel: 'chromium',
       args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
     };
-    if (PROXY_OPTIONS) launch.proxy = PROXY_OPTIONS;
+    const launchProxy = LOCAL_PROXY_OPTIONS || PROXY_OPTIONS;
+    if (launchProxy) launch.proxy = launchProxy;
     this.browser = await chromium.launch(launch);
     if (!this.userAgent) {
       const major = String(this.browser.version() || '145').split('.')[0];
@@ -163,6 +220,7 @@ class SolverPage {
   async stop() {
     try { if (this.context) await this.context.close(); } catch (err) { /* ignore */ }
     try { if (this.browser) await this.browser.close(); } catch (err) { /* ignore */ }
+    stopLocalProxy();
   }
 
   /** 串行化重开，避免并发请求各开一个页面。 */
@@ -369,6 +427,7 @@ process.on('SIGINT', () => { shutdown('SIGINT'); });
 
 (async () => {
   try {
+    await startLocalProxy();
     await solver.start();
   } catch (err) {
     solver.lastError = errText(err);

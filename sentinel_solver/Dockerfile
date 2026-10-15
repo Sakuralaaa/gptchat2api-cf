@@ -14,6 +14,17 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 # channel="chromium" 需要完整 Chromium（不是 headless shell）
 RUN npx playwright install --with-deps chromium
+# Chromium 不支持带用户名密码的 SOCKS5 代理，用 gost 把这种上游转发成本机无认证的 SOCKS5
+ARG GOST_VERSION=2.11.5
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    curl -fsSL -o /tmp/gost.gz "https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-amd64-${GOST_VERSION}.gz"; \
+    gunzip -c /tmp/gost.gz > /usr/local/bin/gost; \
+    chmod +x /usr/local/bin/gost; \
+    rm -f /tmp/gost.gz; \
+    gost -V
 
 COPY vm.js server.js ./
 

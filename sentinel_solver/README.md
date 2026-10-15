@@ -45,6 +45,7 @@ CHATGPT2API_SENTINEL_SOLVER_KEY=<与 SENTINEL_SOLVER_KEY 相同>
 | --- | --- | --- |
 | `SENTINEL_SOLVER_KEY` | 空 | 访问密钥 |
 | `SENTINEL_SOLVER_PROXY` | 空 | 浏览器出网代理，应与主服务访问 chatgpt.com 的出口一致 |
+| `SENTINEL_SOLVER_LOCAL_PROXY_PORT` | 1080 | 上游是带认证的 SOCKS5 时，本机无认证转发端口 |
 | `SENTINEL_SOLVER_USER_AGENT` | 按内置 Chromium 版本生成 | 页面 UA |
 | `SENTINEL_SOLVER_TIMEZONE` | 跟随系统 | 页面时区（如 `America/Phoenix`），应与出口 IP 所在地一致 |
 | `SENTINEL_SOLVER_REFRESH_SECONDS` | 1800 | 页面定期重开的间隔 |
@@ -57,6 +58,7 @@ CHATGPT2API_SENTINEL_SOLVER_KEY=<与 SENTINEL_SOLVER_KEY 相同>
 
 - 页面时区与 `getTimezoneOffset()` 都从**真实页面**读取（`/health` 返回 `timezone` / `timezone_offset_min` / `timezone_long_name` / `locale`），夏令时切换会自动跟随，不需要写死偏移值。
 - `SENTINEL_SOLVER_PROXY` 支持带认证信息（`http://user:pass@host:port`），用户名密码会拆出来传给 Chromium。
+- Chromium 不支持带用户名密码的 SOCKS5 代理：检测到这种上游时，本服务会用内置的 gost 在本机起一个无认证 SOCKS5 转发，Chromium 只连 `127.0.0.1`（端口见 `SENTINEL_SOLVER_LOCAL_PROXY_PORT`）。
 - 本服务的出口是**固定**的（不随账号动态切换）。同一个代理供应商/主机不代表同一个出口，代理账号里的 session 不同也可能分配到不同 IP，因此无法保证整个号池都与同一出口一致。
 
 - 必须使用完整 Chromium 的新版无头模式（`channel="chromium"`）；默认的 headless shell 会停在 Cloudflare「请稍候…」，算出的 token 无效。
