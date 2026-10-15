@@ -162,11 +162,17 @@ function withTimeout(promise, ms, message) {
 // chunk 文件名带内容哈希、每次发版都变，所以求解时动态发现，不写死。
 const PINNED_TURNSTILE_ASSET = '/unauth-mweb/assets/turnstile-DykPLDEM.js';
 const DISCOVER_TURNSTILE_ASSET = `() => {
-  const pattern = /\\/turnstile-[^/"']+\\.js/;
+  const re = /\\/turnstile-[^/"'\\s]+?\\.js/g;
   const seen = [];
-  const push = (url) => { if (url && pattern.test(url) && !seen.includes(url)) seen.push(url); };
-  try { performance.getEntriesByType('resource').forEach((e) => push(e.name)); } catch (err) {}
-  try { Array.from(document.scripts).forEach((s) => push(s.src)); } catch (err) {}
+  const add = (value) => {
+    if (!value) return;
+    const hits = String(value).match(re);
+    if (hits) hits.forEach((hit) => { if (!seen.includes(hit)) seen.push(hit); });
+  };
+  try { performance.getEntriesByType('resource').forEach((e) => add(e.name)); } catch (err) {}
+  try { Array.from(document.scripts).forEach((s) => { add(s.src); add(s.textContent); }); } catch (err) {}
+  try { Array.from(document.querySelectorAll('link[href]')).forEach((l) => add(l.href)); } catch (err) {}
+  try { add(document.documentElement ? document.documentElement.outerHTML : ''); } catch (err) {}
   return seen;
 }`;
 const SCAN_TURNSTILE_ASSET_IN_SCRIPTS = `async (pattern) => {
@@ -203,6 +209,15 @@ const SOLVE_TURNSTILE_VIA_SDK = `async ([requirements, key, asset]) => {
   }
 }`;
 const SOLVE_TURNSTILE_VIA_VM = `([dx, p]) => window.__sentinelVM.turnstile(dx, p)`;
+const VERIFY_TURNSTILE_ASSET = `async (asset) => {
+  try {
+    const r = await fetch(asset, { method: 'GET' });
+    const text = await r.text();
+    return { status: r.status, ok: r.ok, bytes: text.length, looksLikeModule: /turnstile|getEnforcementToken|export/i.test(text) };
+  } catch (err) {
+    return { error: String(err).slice(0, 200) };
+  }
+}`;
 const WARM_TURNSTILE_ASSET = `async (asset) => {
   try {
     const mod = await import(asset);
@@ -257,6 +272,7 @@ class SolverPage {
     this.lastError = '';
     this.profile = null;
     this.turnstileAssetPath = '';
+    this.lastSolve = null;
     this.lock = Promise.resolve();
   }
 
@@ -403,33 +419,48 @@ class SolverPage {
       }
     } catch (err) {
       this.lastError = errText(err);
+      log('turnstile asset discovery error:', errText(err));
     }
     log('turnstile asset discovery fell back to', PINNED_TURNSTILE_ASSET);
     this.turnstileAssetPath = PINNED_TURNSTILE_ASSET;
+    await this.warmTurnstileAsset(this.turnstileAssetPath);
     return this.turnstileAssetPath;
   }
 
   /** 提前 import 一次页面自带的 turnstile 模块，把它预热进模块缓存。 */
   async warmTurnstileAsset(asset) {
     try {
-      const ready = await this.evaluate(WARM_TURNSTILE_ASSET, asset, SDK_SOLVE_TIMEOUT_MS);
-      log(`turnstile asset warm-up ${ready ? 'ok' : 'failed'}:`, asset);
+      const check = await this.evaluate(VERIFY_TURNSTILE_ASSET, asset, SDK_SOLVE_TIMEOUT_MS);
+      log(`turnstile asset check ${JSON.stringify(check)}:`, asset);
+      if (check && check.ok) {
+        const ready = await this.evaluate(WARM_TURNSTILE_ASSET, asset, SDK_SOLVE_TIMEOUT_MS);
+        log(`turnstile asset warm-up ${ready ? 'ok' : 'failed'}:`, asset);
+      }
     } catch (err) {
       this.lastError = errText(err);
+      log('turnstile asset warm-up error:', errText(err));
     }
   }
 
   /** 优先用页面自带的 turnstile 模块求解，失败再回退内置 VM。 */
   async solveTurnstile(requirements, dx, p) {
+    const diag = { at: new Date().toISOString(), dxLen: String(dx || '').length, pLen: String(p || '').length, hasRequirements: !!requirements };
+    this.lastSolve = diag;
     if (requirements) {
       const asset = await this.resolveTurnstileAsset();
+      diag.asset = asset;
       let result = '';
       try {
-        result = String((await this.evaluate(SOLVE_TURNSTILE_VIA_SDK, [requirements, p, asset], SDK_SOLVE_TIMEOUT_MS)) || '');
+        const raw = await this.evaluate(SOLVE_TURNSTILE_VIA_SDK, [requirements, p, asset], SDK_SOLVE_TIMEOUT_MS);
+        diag.sdkType = typeof raw;
+        result = String(raw == null ? '' : raw);
       } catch (err) {
         result = 'ERR:' + errText(err);
       }
+      diag.sdkResult = result.slice(0, 300);
+      diag.sdkLen = result.length;
       if (result && !result.startsWith('ERR:')) {
+        diag.via = 'sdk';
         return { ok: true, token: result };
       }
       this.lastError = result.slice(0, 300);
@@ -439,11 +470,50 @@ class SolverPage {
       await this.invalidate();
     }
     if (!dx) {
+      diag.via = 'none';
       return { ok: false, token: this.lastError || 'no dx and no requirements supplied' };
     }
-    const result = String((await this.evaluate(SOLVE_TURNSTILE_VIA_VM, [dx, p], VM_SOLVE_TIMEOUT_MS)) || '');
-    if (result.startsWith('ERR:')) return { ok: false, token: result.slice(4) };
-    return { ok: !!result, token: result };
+    let vm = '';
+    try {
+      const raw = await this.evaluate(SOLVE_TURNSTILE_VIA_VM, [dx, p], VM_SOLVE_TIMEOUT_MS);
+      diag.vmType = typeof raw;
+      vm = String(raw == null ? '' : raw);
+    } catch (err) {
+      vm = 'ERR:' + errText(err);
+    }
+    diag.vmLen = vm.length;
+    diag.vmResult = vm.slice(0, 300);
+    diag.via = 'vm';
+    if (vm.startsWith('ERR:')) return { ok: false, token: vm.slice(4) };
+    return { ok: !!vm, token: vm };
+  }
+
+  /** Diagnostics for the live page: what it loaded and how the last solve went. */
+  async debugState() {
+    const out = {
+      lastError: this.lastError || null,
+      turnstileAssetPath: this.turnstileAssetPath || null,
+      lastSolve: this.lastSolve || null,
+    };
+    try {
+      out.page = await this.evaluate(
+        `async () => ({
+          title: document.title,
+          host: location.hostname,
+          readyState: document.readyState,
+          vm: typeof window.__sentinelVM,
+          vmTurnstile: window.__sentinelVM ? typeof window.__sentinelVM.turnstile : 'n/a',
+          scriptSrcs: Array.from(document.scripts).map((s) => s.src).filter(Boolean),
+          turnstileish: performance.getEntriesByType('resource').map((e) => e.name).filter((n) => /turnstile|assets\\//i.test(n)),
+          htmlTurnstile: (document.documentElement ? document.documentElement.outerHTML : '').match(/\\/unauth-mweb\\/assets\\/turnstile-[A-Za-z0-9_-]+\\.js/g),
+        })`,
+        null,
+        20000
+      );
+    } catch (err) {
+      out.pageError = errText(err);
+    }
+    return out;
   }
 
   status() {
@@ -526,6 +596,11 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, solver.status());
       return;
     }
+    if (req.method === 'GET' && url.pathname === '/debug/state') {
+      requireKey(req);
+      send(res, 200, await solver.debugState());
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/v1/turnstile') {
       requireKey(req);
       const body = await readBody(req);
@@ -539,7 +614,8 @@ const server = http.createServer(async (req, res) => {
       }
       const outcome = await solver.solveTurnstile(requirements, dx, p);
       const value = outcome.token == null ? '' : String(outcome.token);
-      const failure = outcome.ok ? tokenFailure(value) : value;
+      let failure = outcome.ok ? tokenFailure(value) : value;
+      if (!failure && !value) failure = 'solve produced an empty token ' + JSON.stringify(solver.lastSolve || {});
       log(`turnstile dx_len=${dx.length} p_len=${p.length} via_sdk=${requirements ? 'yes' : 'no'} token_len=${value.length}${failure ? ` FAILED=${String(failure).slice(0, 200)}` : ''}`);
       if (failure) {
         send(res, 502, { detail: `turnstile solve failed: ${String(failure).slice(0, 300)}` });
