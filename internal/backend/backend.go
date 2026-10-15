@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"chatgpt2api/internal/contextoffload"
@@ -52,6 +53,9 @@ type Client struct {
 	sessionID    string
 	powSources   []string
 	powDataBuild string
+	timezone          powTimezone
+	timezoneMu        sync.Mutex
+	timezoneExpiresAt time.Time
 }
 
 type ChatRequirements struct {
@@ -177,8 +181,8 @@ func (c *Client) StreamConversation(ctx context.Context, messages []map[string]a
 				}
 			}
 		}
-		path, timezoneName := c.chatTarget()
-		payload := c.conversationPayload(messages, model, timezoneName)
+		path, _ := c.chatTarget()
+		payload := c.conversationPayload(messages, model, c.conversationTimezoneName())
 		resp, err := c.postJSON(ctx, path, payload, c.conversationHeaders(path, reqs), true)
 		if err != nil {
 			errCh <- err
@@ -431,58 +435,88 @@ func (c *Client) doBootstrap(ctx context.Context) (int, []byte, error) {
 }
 
 func (c *Client) getChatRequirements(ctx context.Context) (ChatRequirements, error) {
-	path := "/backend-anon/sentinel/chat-requirements"
+	base := "/backend-anon/sentinel/chat-requirements"
 	contextName := "noauth_chat_requirements"
 	if c.AccessToken != "" {
-		path = "/backend-api/sentinel/chat-requirements"
+		base = "/backend-api/sentinel/chat-requirements"
 		contextName = "auth_chat_requirements"
 	}
-	p := buildLegacyRequirementsToken(c.userAgent, c.powSources, c.powDataBuild)
-	resp, err := c.postJSON(ctx, path, map[string]any{"p": p}, c.headers(path, map[string]string{"Content-Type": "application/json"}), false)
+	// The requirements and proof tokens must encode the UA of the page that
+	// solved the Turnstile challenge, otherwise the conversation endpoint
+	// answers with a disguised "Model not found" 404.
+	sentinelUserAgent := c.sentinelUserAgent(ctx)
+	timezone := c.powTimezone(ctx)
+	p := buildRequirementsToken(sentinelUserAgent, c.powSources, c.powDataBuild, timezone)
+
+	preparePath := base + "/prepare"
+	resp, err := c.postJSON(ctx, preparePath, map[string]any{"p": p}, c.headers(preparePath, map[string]string{"Content-Type": "application/json"}), false)
 	if err != nil {
 		return ChatRequirements{}, err
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ChatRequirements{}, upstreamHTTPError(contextName, resp.StatusCode, data)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return ChatRequirements{}, err
-	}
-	reqs, err := c.buildRequirements(payload, "")
+	prepareData, err := decodeJSONResponse(resp, contextName+"_prepare")
 	if err != nil {
 		return ChatRequirements{}, err
+	}
+	if arkose := util.StringMap(prepareData["arkose"]); util.ToBool(arkose["required"]) {
+		return ChatRequirements{}, fmt.Errorf("chat requirements requires arkose token, which is not implemented")
+	}
+
+	proofToken := ""
+	if proof := util.StringMap(prepareData["proofofwork"]); util.ToBool(proof["required"]) {
+		proofToken, err = buildProofToken(util.Clean(proof["seed"]), util.Clean(proof["difficulty"]), p)
+		if err != nil {
+			return ChatRequirements{}, err
+		}
+	}
+
+	turnstileToken := ""
+	if turnstile := util.StringMap(prepareData["turnstile"]); util.ToBool(turnstile["required"]) && util.Clean(turnstile["dx"]) != "" {
+		turnstileToken = c.solveTurnstileChallenge(ctx, util.Clean(turnstile["dx"]), p)
+	}
+
+	finalizePath := base + "/finalize"
+	payload := map[string]any{
+		"prepare_token": util.Clean(prepareData["prepare_token"]),
+		"proofofwork":   proofToken,
+		"turnstile":     turnstileToken,
+	}
+	resp, err = c.postJSON(ctx, finalizePath, payload, c.headers(finalizePath, map[string]string{"Content-Type": "application/json"}), false)
+	if err != nil {
+		return ChatRequirements{}, err
+	}
+	data, err := decodeJSONResponse(resp, contextName+"_finalize")
+	if err != nil {
+		return ChatRequirements{}, err
+	}
+
+	reqs := ChatRequirements{
+		Token:          util.Clean(data["token"]),
+		ProofToken:     proofToken,
+		TurnstileToken: turnstileToken,
+		SOToken:        util.Clean(data["so_token"]),
+		Raw:            data,
 	}
 	if reqs.Token == "" {
 		if c.AccessToken != "" {
-			return ChatRequirements{}, fmt.Errorf("missing auth chat requirements token: %v", payload)
+			return ChatRequirements{}, fmt.Errorf("missing auth chat requirements token: %v", data)
 		}
-		return ChatRequirements{}, fmt.Errorf("missing chat requirements token: %v", payload)
+		return ChatRequirements{}, fmt.Errorf("missing chat requirements token: %v", data)
 	}
 	return reqs, nil
 }
 
-func (c *Client) buildRequirements(data map[string]any, sourceP string) (ChatRequirements, error) {
-	if arkose := util.StringMap(data["arkose"]); util.ToBool(arkose["required"]) {
-		return ChatRequirements{}, fmt.Errorf("chat requirements requires arkose token, which is not implemented")
+// decodeJSONResponse drains a JSON response, turning a non-2xx status into an
+// upstream error that carries the server's detail message.
+func decodeJSONResponse(resp *http.Response, contextName string) (map[string]any, error) {
+	defer resp.Body.Close()
+	if err := ensureOK(resp, contextName); err != nil {
+		return nil, err
 	}
-	proofToken := ""
-	proof := util.StringMap(data["proofofwork"])
-	if util.ToBool(proof["required"]) {
-		token, err := buildProofToken(util.Clean(proof["seed"]), util.Clean(proof["difficulty"]), c.userAgent, c.powSources, c.powDataBuild)
-		if err != nil {
-			return ChatRequirements{}, err
-		}
-		proofToken = token
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
 	}
-	turnstileToken := ""
-	turnstile := util.StringMap(data["turnstile"])
-	if util.ToBool(turnstile["required"]) && util.Clean(turnstile["dx"]) != "" {
-		turnstileToken = solveTurnstileToken(util.Clean(turnstile["dx"]), sourceP)
-	}
-	return ChatRequirements{Token: util.Clean(data["token"]), ProofToken: proofToken, TurnstileToken: turnstileToken, SOToken: util.Clean(data["so_token"]), Raw: data}, nil
+	return payload, nil
 }
 
 func (c *Client) chatTarget() (string, string) {
@@ -509,8 +543,8 @@ func (c *Client) prepareTextConversation(ctx context.Context, messages []map[str
 		"parent_message_id":     util.NewUUID(),
 		"model":                 textModelSlug(model),
 		"client_prepare_state":  "success",
-		"timezone_offset_min":   -480,
-		"timezone":              "Asia/Shanghai",
+		"timezone_offset_min":   c.conversationTimezoneOffsetMin(),
+		"timezone":              c.conversationTimezoneName(),
 		"conversation_mode":     map[string]any{"kind": "primary_assistant"},
 		"system_hints":          []any{},
 		"partial_query": map[string]any{
@@ -570,8 +604,8 @@ func (c *Client) startTextConversation(ctx context.Context, messages []map[strin
 		"parent_message_id":                    util.NewUUID(),
 		"model":                                textModelSlug(model),
 		"client_prepare_state":                 "sent",
-		"timezone_offset_min":                  -480,
-		"timezone":                             "Asia/Shanghai",
+				"timezone_offset_min":                  c.conversationTimezoneOffsetMin(),
+				"timezone":                             c.conversationTimezoneName(),
 		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
 		"enable_message_followups":             true,
 		"system_hints":                         []any{},
@@ -653,8 +687,8 @@ func (c *Client) prepareMultimodalConversation(ctx context.Context, messages []m
 		"parent_message_id":     util.NewUUID(),
 		"model":                 textModelSlug(model),
 		"client_prepare_state":  "success",
-		"timezone_offset_min":   -480,
-		"timezone":              "Asia/Shanghai",
+		"timezone_offset_min":   c.conversationTimezoneOffsetMin(),
+		"timezone":              c.conversationTimezoneName(),
 		"conversation_mode":     map[string]any{"kind": "primary_assistant"},
 		"system_hints":          []any{},
 		"partial_query": map[string]any{
@@ -709,8 +743,8 @@ func (c *Client) startMultimodalConversation(ctx context.Context, messages []map
 		"parent_message_id":                    util.NewUUID(),
 		"model":                                textModelSlug(model),
 		"client_prepare_state":                 "sent",
-		"timezone_offset_min":                  -480,
-		"timezone":                             "Asia/Shanghai",
+				"timezone_offset_min":                  c.conversationTimezoneOffsetMin(),
+				"timezone":                             c.conversationTimezoneName(),
 		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
 		"enable_message_followups":             true,
 		"system_hints":                         []any{},
@@ -785,7 +819,7 @@ func (c *Client) conversationPayload(messages []map[string]any, model, timezoneN
 		"force_paragen": false, "force_paragen_model_slug": "", "force_rate_limit": false, "force_use_sse": true,
 		"history_and_training_disabled": true, "reset_rate_limits": false, "suggestions": []any{}, "supported_encodings": []any{"v1"},
 		"enable_message_followups": true, "supports_buffering": true,
-		"system_hints": []any{}, "timezone": timezoneName, "timezone_offset_min": -480,
+		"system_hints": []any{}, "timezone": c.conversationTimezoneName(), "timezone_offset_min": c.conversationTimezoneOffsetMin(),
 		"variant_purpose": "comparison_implicit", "websocket_request_id": util.NewUUID(),
 		"client_contextual_info": map[string]any{"is_dark_mode": false, "time_since_loaded": 120, "page_height": 900, "page_width": 1400, "pixel_ratio": 2, "screen_height": 1440, "screen_width": 2560},
 	}

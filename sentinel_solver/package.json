@@ -1,0 +1,16 @@
+{
+  "name": "chatgpt2api-sentinel-solver",
+  "version": "1.0.0",
+  "private": true,
+  "description": "常驻无头 Chromium 的 chatgpt.com 页面，替主服务计算 Sentinel Turnstile / SO token。",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "1.49.0"
+  }
+}

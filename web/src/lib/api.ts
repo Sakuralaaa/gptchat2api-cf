@@ -300,6 +300,8 @@ type AccountUpdateResponse = {
 export type SettingsConfig = {
   proxy: string;
   flaresolverr?: string;
+  sentinel_solver_url?: string;
+  sentinel_solver_key?: string;
   base_url?: string;
   registration_enabled?: boolean;
   refresh_account_interval_minute?: number | string;
@@ -1794,6 +1796,8 @@ export type ProxySettings = {
   enabled: boolean;
   url: string;
   flaresolverr?: string;
+  sentinel_solver_url?: string;
+  sentinel_solver_key?: string;
 };
 
 export type ProxyTestResult = {
@@ -1807,7 +1811,7 @@ export async function fetchProxy() {
   return httpRequest<{ proxy: ProxySettings }>("/api/proxy");
 }
 
-export async function updateProxy(updates: { enabled?: boolean; url?: string; flaresolverr?: string }) {
+export async function updateProxy(updates: { enabled?: boolean; url?: string; flaresolverr?: string; sentinel_solver_url?: string; sentinel_solver_key?: string }) {
   return httpRequest<{ proxy: ProxySettings }>("/api/proxy", {
     method: "POST",
     body: updates,

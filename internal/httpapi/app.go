@@ -1101,7 +1101,7 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": a.config.Proxy(), "flaresolverr": a.config.FlareSolverr()}})
+		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": a.config.Proxy(), "flaresolverr": a.config.FlareSolverr(), "sentinel_solver_url": a.config.SentinelSolverURL(), "sentinel_solver_key": a.config.SentinelSolverKey()}})
 	case http.MethodPost:
 		body, _ := readJSONMap(r)
 		updates := map[string]any{}
@@ -1110,13 +1110,19 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := body["flaresolverr"]; ok {
 			updates["flaresolverr"] = util.Clean(body["flaresolverr"])
+		if _, ok := body["sentinel_solver_url"]; ok {
+			updates["sentinel_solver_url"] = util.Clean(body["sentinel_solver_url"])
+		}
+		if _, ok := body["sentinel_solver_key"]; ok {
+			updates["sentinel_solver_key"] = util.Clean(body["sentinel_solver_key"])
+		}
 		}
 		updated, err := a.config.Update(updates)
 		if err != nil {
 			util.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": updated["proxy"], "flaresolverr": updated["flaresolverr"]}})
+		util.WriteJSON(w, http.StatusOK, map[string]any{"proxy": map[string]any{"url": updated["proxy"], "flaresolverr": updated["flaresolverr"], "sentinel_solver_url": updated["sentinel_solver_url"], "sentinel_solver_key": updated["sentinel_solver_key"]}})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}

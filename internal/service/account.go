@@ -37,6 +37,8 @@ type AccountConfig interface {
 	AutoRemoveRateLimitedAccounts() bool
 	TextAccountScheduleMode() string
 	ImageAccountScheduleMode() string
+	SentinelSolverURL() string
+	SentinelSolverKey() string
 }
 
 type AccountLease struct {
@@ -71,6 +73,7 @@ type AccountService struct {
 	stickyTextToken           string
 	stickyImageToken          string
 	textCooldownUntil         time.Time
+	imageRejectedCooldown     map[string]time.Time
 	random                    *rand.Rand
 	refresher                 *SessionRefresher
 	reloginRunning            map[string]struct{}
@@ -1040,16 +1043,63 @@ func (s *AccountService) GetAvailableImageAccessTokenFor(ctx context.Context, al
 			lastRefreshErr = refreshErr
 			if cached := s.cachedAccountForTransientRefreshError(lease.Token, refreshErr); cached != nil &&
 				(allow == nil || allow(cached)) &&
-				s.reservedImageSlotAvailable(reservation) {
+				s.reservedImageSlotAvailable(reservation) &&
+				!s.imageAccountRejectedCooledDown(lease.Token) {
 				return lease, nil
 			}
 		}
-		if account != nil && (allow == nil || allow(account)) && s.reservedImageSlotAvailable(reservation) {
+		if account != nil && (allow == nil || allow(account)) && s.reservedImageSlotAvailable(reservation) && !s.imageAccountRejectedCooledDown(lease.Token) {
 			return lease, nil
 		}
 		lease.Release()
 		s.releaseImageReservation(reservation.token)
 	}
+}
+
+// imageRejectedCooldownWindow is how long an account is skipped after
+// chatgpt.com answered its image conversation with the disguised
+// "Model not found" 404.
+const imageRejectedCooldownWindow = 10 * time.Minute
+
+// MarkImageAccountRejected records a short local cooldown for an account whose
+// image conversation was rejected by the upstream quality check. It does not
+// touch quota, status, or proxy health: the rejection is a request quality
+// signal, not a permanent account failure.
+func (s *AccountService) MarkImageAccountRejected(accessToken string) {
+	if s == nil {
+		return
+	}
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.imageRejectedCooldown == nil {
+		s.imageRejectedCooldown = map[string]time.Time{}
+	}
+	s.imageRejectedCooldown[accessToken] = time.Now().Add(imageRejectedCooldownWindow)
+}
+
+func (s *AccountService) imageAccountRejectedCooledDown(accessToken string) bool {
+	if s == nil {
+		return false
+	}
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	until, ok := s.imageRejectedCooldown[accessToken]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(s.imageRejectedCooldown, accessToken)
+		return false
+	}
+	return true
 }
 
 func (s *AccountService) cachedAccountForTransientRefreshError(accessToken string, err error) map[string]any {
@@ -1782,6 +1832,16 @@ func (s *AccountService) SolveCloudflare(ctx context.Context, client *http.Clien
 		return "", false
 	}
 	return s.passCloudflareForClient(ctx, client, strings.TrimRight(baseURL, "/"))
+}
+
+// SentinelSolverConfig exposes the resident-browser sentinel solver service
+// (sentinel_solver/) so the chat backend can compute Turnstile tokens inside a
+// real chatgpt.com page instead of simulating the challenge VM in-process.
+func (s *AccountService) SentinelSolverConfig() (string, string) {
+	if s == nil || s.config == nil {
+		return "", ""
+	}
+	return s.config.SentinelSolverURL(), s.config.SentinelSolverKey()
 }
 
 func (s *AccountService) StartLimitedWatcher(ctx context.Context, interval time.Duration) {

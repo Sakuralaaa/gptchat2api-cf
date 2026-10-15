@@ -20,6 +20,8 @@ var settingEnvKeys = map[string]string{
 	"base_url":                          "CHATGPT2API_BASE_URL",
 	"proxy":                             "CHATGPT2API_PROXY",
 	"flaresolverr":                      "CHATGPT2API_FLARESOLVERR",
+	"sentinel_solver_url":               "CHATGPT2API_SENTINEL_SOLVER_URL",
+	"sentinel_solver_key":               "CHATGPT2API_SENTINEL_SOLVER_KEY",
 	"refresh_account_interval_minute":   "CHATGPT2API_REFRESH_ACCOUNT_INTERVAL_MINUTE",
 	"image_task_timeout_seconds":        "CHATGPT2API_IMAGE_TASK_TIMEOUT_SECONDS",
 	"user_default_concurrent_limit":     "CHATGPT2API_USER_DEFAULT_CONCURRENT_LIMIT",
@@ -279,6 +281,14 @@ func (s *Store) FlareSolverr() string {
 	return strings.TrimSpace(fmt.Sprint(s.settingValue("flaresolverr", "")))
 }
 
+func (s *Store) SentinelSolverURL() string {
+	return strings.TrimRight(strings.TrimSpace(fmt.Sprint(s.settingValue("sentinel_solver_url", ""))), "/")
+}
+
+func (s *Store) SentinelSolverKey() string {
+	return strings.TrimSpace(fmt.Sprint(s.settingValue("sentinel_solver_key", "")))
+}
+
 
 func (s *Store) LogLevels() []string {
 	raw := s.settingValue("log_levels", "")
@@ -372,6 +382,8 @@ func (s *Store) Get() map[string]any {
 	data["log_levels"] = s.LogLevels()
 	data["proxy"] = s.Proxy()
 	data["flaresolverr"] = s.FlareSolverr()
+	data["sentinel_solver_url"] = s.SentinelSolverURL()
+	data["sentinel_solver_key"] = s.SentinelSolverKey()
 	data["base_url"] = s.BaseURL()
 	data["registration_enabled"] = s.RegistrationEnabled()
 	data["login_page_image_url"] = s.LoginPageImageURL()

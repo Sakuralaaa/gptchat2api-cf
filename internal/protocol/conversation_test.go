@@ -688,9 +688,12 @@ func TestStreamResponsesImageOutputsCompletesWithUpstreamRefusalText(t *testing.
 		case r.Method == http.MethodGet && r.URL.Path == "/":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`<html data-build="build-1"><script src="/backend-api/sentinel/sdk.js"></script></html>`))
-		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/sentinel/chat-requirements":
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/sentinel/chat-requirements/prepare":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"token":"req-token","proofofwork":{"required":false},"turnstile":{"required":false},"arkose":{"required":false}}`))
+			_, _ = w.Write([]byte(`{"prepare_token":"prep-token","proofofwork":{"required":false},"turnstile":{"required":false},"arkose":{"required":false}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/sentinel/chat-requirements/finalize":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"token":"req-token","so_token":""}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/f/conversation/prepare":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"conduit_token":"conduit-token"}`))

@@ -24,6 +24,8 @@ func (testTextLeaseConfig) AutoRemoveRateLimitedAccounts() bool { return false }
 func (testTextLeaseConfig) TextAccountScheduleMode() string     { return "load_balance" }
 func (testTextLeaseConfig) ImageAccountScheduleMode() string    { return "load_balance" }
 func (testTextLeaseConfig) Proxy() string                       { return "" }
+func (testTextLeaseConfig) SentinelSolverURL() string           { return "" }
+func (testTextLeaseConfig) SentinelSolverKey() string           { return "" }
 
 type testProtocolStorageBackend struct {
 	accounts []map[string]any

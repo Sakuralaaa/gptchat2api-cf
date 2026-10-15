@@ -94,7 +94,7 @@ func (c *Client) createTextContextFile(ctx context.Context, filename, mimeType s
 		"file_name":                filename,
 		"file_size":                size,
 		"use_case":                 "my_files",
-		"timezone_offset_min":      -480,
+		"timezone_offset_min":      c.conversationTimezoneOffsetMin(),
 		"reset_rate_limits":        false,
 		"mime_type":                mimeType,
 		"store_in_library":         true,

@@ -37,6 +37,8 @@ func (c testAccountConfig) ImageAccountScheduleMode() string {
 	return c.imageMode
 }
 func (testAccountConfig) Proxy() string { return "" }
+func (testAccountConfig) SentinelSolverURL() string { return "" }
+func (testAccountConfig) SentinelSolverKey() string { return "" }
 
 func TestFetchRemoteInfoBootstrapsBeforeAccountRefresh(t *testing.T) {
 	var mu sync.Mutex

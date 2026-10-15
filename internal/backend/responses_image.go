@@ -170,6 +170,48 @@ func usesCodexResponsesImageRoute(model string) bool {
 	}
 }
 
+// ImageAccountRejectedError marks the disguised 404 chatgpt.com returns when
+// the request quality (sentinel handshake / account) is not good enough. It is
+// retryable on another account and never a permanent account failure: the
+// caller must not clear quota, ban the account, or penalise the proxy.
+type ImageAccountRejectedError struct{ Message string }
+
+func (e ImageAccountRejectedError) Error() string { return e.Message }
+
+// ImageAccountRejectionReporter is an optional capability of the account
+// lookup: it puts an account behind a short local cooldown after its image
+// conversation was rejected by the upstream quality check.
+type ImageAccountRejectionReporter interface {
+	MarkImageAccountRejected(accessToken string)
+}
+
+// imageAccountRejected reports whether a response is the disguised
+// "Model not found" 404. Only that exact detail qualifies; every other 404 is
+// an ordinary upstream error.
+func imageAccountRejected(status int, body []byte) bool {
+	if status != http.StatusNotFound {
+		return false
+	}
+	var payload struct {
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(body))), &payload); err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(payload.Detail), "Model not found")
+}
+
+// reportImageAccountRejected cools the current account down so the next lease
+// picks a different one. It deliberately leaves quota, status and proxy health
+// untouched.
+func (c *Client) reportImageAccountRejected() {
+	reporter, ok := c.lookup.(ImageAccountRejectionReporter)
+	if !ok || reporter == nil || strings.TrimSpace(c.AccessToken) == "" {
+		return
+	}
+	reporter.MarkImageAccountRejected(c.AccessToken)
+}
+
 func (c *Client) streamOfficialResponsesImage(ctx context.Context, request ResponsesImageRequest, out chan<- ResponsesImageEvent) error {
 	if strings.TrimSpace(c.AccessToken) == "" {
 		return fmt.Errorf("access_token is required for official image conversation route")
@@ -214,6 +256,10 @@ func (c *Client) streamOfficialResponsesImage(ctx context.Context, request Respo
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(resp.Body)
+		if imageAccountRejected(resp.StatusCode, data) {
+			c.reportImageAccountRejected()
+			return ImageAccountRejectedError{Message: "official image account rejected: Model not found"}
+		}
 		return upstreamHTTPError(officialStreamPath, resp.StatusCode, data)
 	}
 	return iterOfficialImageSSE(ctx, c, resp.Body, request, out)
@@ -712,8 +758,8 @@ func (c *Client) prepareOfficialImageConversation(ctx context.Context, prompt st
 		"parent_message_id":     parentMessageID,
 		"model":                 officialImageModelSlug(request.Model),
 		"client_prepare_state":  "success",
-		"timezone_offset_min":   -480,
-		"timezone":              "Asia/Shanghai",
+		"timezone_offset_min":   c.conversationTimezoneOffsetMin(),
+		"timezone":              c.conversationTimezoneName(),
 		"conversation_mode":     map[string]any{"kind": "primary_assistant"},
 		"system_hints":          []any{"picture_v2"},
 		"partial_query": map[string]any{
@@ -907,8 +953,8 @@ func (c *Client) startOfficialImageConversation(ctx context.Context, prompt stri
 		"parent_message_id":                    parentMessageID,
 		"model":                                officialImageModelSlug(request.Model),
 		"client_prepare_state":                 "sent",
-		"timezone_offset_min":                  -480,
-		"timezone":                             "Asia/Shanghai",
+				"timezone_offset_min":                  c.conversationTimezoneOffsetMin(),
+				"timezone":                             c.conversationTimezoneName(),
 		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
 		"enable_message_followups":             true,
 		"system_hints":                         []any{"picture_v2"},

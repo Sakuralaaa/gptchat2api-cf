@@ -1,23 +1,34 @@
 package backend
 
 import (
-	"bytes"
-	"crypto/sha3"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"regexp"
+	"strings"
 	"time"
+	"unicode/utf16"
 
 	"chatgpt2api/internal/util"
 )
 
-const defaultPOWScript = "https://chatgpt.com/backend-api/sentinel/sdk.js"
+const (
+	defaultPOWScript = "https://chatgpt.com/backend-api/sentinel/sdk.js"
+
+	// The conversation endpoints declare the client timezone; it has to agree
+	// with the geolocation of the outbound proxy.
+	defaultConversationTimezone          = "Asia/Shanghai"
+	defaultConversationTimezoneOffsetMin = -480
+
+	powMaxAttempts = 500000
+)
 
 var (
 	scriptSrcRE = regexp.MustCompile(`(?is)<script[^>]+src=["']([^"']+)["']`)
+	dataBuildRE = regexp.MustCompile(`c/[^/]*/_`)
+	htmlBuildRE = regexp.MustCompile(`(?is)<html[^>]*data-build=["']([^"']*)["']`)
+	difficultySanitizeRE = regexp.MustCompile(`[^0-9a-fA-F]`)
 )
 
 func parsePOWResources(html string) ([]string, string) {
@@ -28,43 +39,69 @@ func parsePOWResources(html string) ([]string, string) {
 		src := match[1]
 		sources = append(sources, src)
 		if dataBuild == "" {
-			if hit := regexp.MustCompile(`c/[^/]*/_`).FindString(src); hit != "" {
-				dataBuild = hit
-			}
+			dataBuild = dataBuildRE.FindString(src)
 		}
 	}
 	if len(sources) == 0 {
 		sources = []string{defaultPOWScript}
 	}
 	if dataBuild == "" {
-		if match := regexp.MustCompile(`<html[^>]*data-build=["']([^"']*)["']`).FindStringSubmatch(html); len(match) > 1 {
+		if match := htmlBuildRE.FindStringSubmatch(html); len(match) > 1 {
 			dataBuild = match[1]
 		}
 	}
 	return sources, dataBuild
 }
 
-func buildLegacyRequirementsToken(userAgent string, scriptSources []string, dataBuild string) string {
-	seed := fmt.Sprintf("%f", rand.Float64())
-	config := buildPOWConfig(userAgent, scriptSources, dataBuild)
-	answer, _ := powGenerate(seed, "0fffff", config, 500000)
-	return "gAAAAAC" + answer
+// powTimezone describes the timezone of the environment that solves the
+// sentinel challenge. The challenge programs themselves do not read the clock,
+// but the token payloads embed a Date.prototype.toString() stamp and OpenAI
+// correlates it with the request's exit IP, so it has to match the solver page.
+type powTimezone struct {
+	Name      string
+	OffsetMin int    // JS getTimezoneOffset(): minutes to add to local time to get UTC.
+	LongName  string // e.g. "Mountain Standard Time".
 }
 
-func buildProofToken(seed, difficulty, userAgent string, scriptSources []string, dataBuild string) (string, error) {
-	config := buildPOWConfig(userAgent, scriptSources, dataBuild)
-	answer, solved := powGenerate(seed, difficulty, config, 500000)
-	if !solved {
-		return "", fmt.Errorf("failed to solve proof token: difficulty=%s", difficulty)
+func defaultPowTimezone() powTimezone {
+	return powTimezone{
+		Name:      defaultConversationTimezone,
+		OffsetMin: defaultConversationTimezoneOffsetMin,
+		LongName:  "China Standard Time",
 	}
-	return "gAAAAAB" + answer, nil
 }
 
-func buildPOWConfig(userAgent string, scriptSources []string, dataBuild string) []any {
-	if len(scriptSources) == 0 {
-		scriptSources = []string{defaultPOWScript}
+func (z powTimezone) fixedZone() *time.Location {
+	name := z.LongName
+	if name == "" {
+		name = z.Name
 	}
-	navigatorKeys := []string{
+	if name == "" {
+		name = "UTC"
+	}
+	return time.FixedZone(name, -z.OffsetMin*60)
+}
+
+// formatLocalTime renders the Date.prototype.toString() style stamp embedded in
+// sentinel tokens, e.g. "Mon Oct 15 2026 12:34:56 GMT-0700 (Mountain Standard Time)".
+func (z powTimezone) formatLocalTime(now time.Time) string {
+	offsetSeconds := -z.OffsetMin * 60
+	sign := "+"
+	if offsetSeconds < 0 {
+		sign = "-"
+		offsetSeconds = -offsetSeconds
+	}
+	minutes := offsetSeconds / 60
+	location := z.fixedZone()
+	return fmt.Sprintf("%s GMT%s%02d%02d (%s)",
+		now.In(location).Format("Mon Jan 02 2006 15:04:05"), sign, minutes/60, minutes%60, location.String())
+}
+
+var (
+	powScreenResolutions = [][]int{{1920, 1080}, {1440, 900}, {2560, 1440}, {3840, 2160}}
+	powCores             = []int{8, 16, 24, 32}
+
+	powNavigatorKeys = []string{
 		"registerProtocolHandler−function registerProtocolHandler() { [native code] }",
 		"storage−[object StorageManager]", "locks−[object LockManager]", "appCodeName−Mozilla",
 		"permissions−[object Permissions]", "share−function share() { [native code] }", "webdriver−false",
@@ -80,7 +117,7 @@ func buildPOWConfig(userAgent string, scriptSources []string, dataBuild string) 
 		"sendBeacon−function sendBeacon() { [native code] }", "hardwareConcurrency−32",
 		"windowControlsOverlay−[object WindowControlsOverlay]",
 	}
-	windowKeys := []string{
+	powWindowKeys = []string{
 		"0", "window", "self", "document", "name", "location", "customElements", "history", "navigation",
 		"innerWidth", "innerHeight", "scrollX", "scrollY", "visualViewport", "screenX", "screenY", "outerWidth",
 		"outerHeight", "devicePixelRatio", "screen", "chrome", "navigator", "onresize", "performance", "crypto",
@@ -88,65 +125,115 @@ func buildPOWConfig(userAgent string, scriptSources []string, dataBuild string) 
 		"postMessage", "queueMicrotask", "requestAnimationFrame", "setInterval", "setTimeout", "caches",
 		"__NEXT_DATA__", "__BUILD_MANIFEST", "__NEXT_PRELOADREADY",
 	}
-	documentKeys := []string{"_reactListeningo743lnnpvdg", "location"}
-	cores := []int{8, 16, 24, 32}
-	now := time.Now().In(time.FixedZone("EST", -5*3600)).Format("Mon Jan 02 2006 15:04:05") + " GMT-0500 (Eastern Standard Time)"
+	powDocumentKeys = []string{"_reactListeningo743lnnpvdg", "location"}
+)
+
+// buildPOWConfig builds the 25 field payload the current challenge program
+// expects. Indices 3 and 9 are the proof-of-work nonce and are overwritten
+// while solving; everything else is a fingerprint sample.
+func buildPOWConfig(userAgent string, scriptSources []string, dataBuild string, tz powTimezone) []any {
+	if len(scriptSources) == 0 {
+		scriptSources = []string{defaultPOWScript}
+	}
+	perfNow := rand.Float64()*49000 + 1000
+	screen := powScreenResolutions[rand.Intn(len(powScreenResolutions))]
 	return []any{
-		randomChoiceInt([]int{3000, 4000, 5000}),
-		now,
+		screen[0] + screen[1],
+		tz.formatLocalTime(time.Now()),
 		4294705152,
-		0,
+		1,
 		userAgent,
 		randomChoice(scriptSources),
 		dataBuild,
 		"en-US",
 		"en-US,es-US,en,es",
-		0,
-		randomChoice(navigatorKeys),
-		randomChoice(documentKeys),
-		randomChoice(windowKeys),
-		float64(time.Now().UnixNano()) / 1e6,
+		rand.Float64(),
+		randomChoice(powNavigatorKeys),
+		randomChoice(powDocumentKeys),
+		randomChoice(powWindowKeys),
+		perfNow,
 		util.NewUUID(),
 		"",
-		randomChoiceInt(cores),
-		float64(time.Now().UnixNano())/1e6 - float64(time.Now().UnixNano())/1e6,
+		randomChoiceInt(powCores),
+		float64(time.Now().UnixNano())/1e6 - perfNow,
+		0, 0, 0, 0, 0, 0, 0,
 	}
 }
 
-func powGenerate(seed, difficulty string, config []any, limit int) (string, bool) {
-	target, err := hex.DecodeString(difficulty)
+func encodePOWPayload(config []any) string {
+	data, _ := json.Marshal(config)
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+// buildRequirementsToken builds the "requirements token" submitted as `p` when
+// opening the sentinel chat-requirements handshake. The challenge program is
+// XOR encrypted with this value, so the solver must receive the same string.
+func buildRequirementsToken(userAgent string, scriptSources []string, dataBuild string, tz powTimezone) string {
+	return "gAAAAAC" + encodePOWPayload(buildPOWConfig(userAgent, scriptSources, dataBuild, tz))
+}
+
+// buildProofToken solves the sentinel proof of work. The current challenge
+// program uses FNV-1a 32 bit plus an avalanche step and expects the "~S"
+// suffix. The 25 field payload is reused from the requirements token that was
+// submitted as `p`, so both carry the same fingerprint sample.
+func buildProofToken(seed, difficulty, requirementsToken string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(requirementsToken, "gAAAAAC"))
 	if err != nil {
-		target = []byte{0x0f, 0xff, 0xff}
+		return "", fmt.Errorf("decode requirements token: %w", err)
 	}
-	diffLen := len(difficulty) / 2
-	seedBytes := []byte(seed)
-	part1 := mustMarshal(config[:3])
-	part1 = append(part1[:len(part1)-1], ',')
-	part2 := mustMarshal(config[4:9])
-	part2 = append([]byte(","), part2[1:len(part2)-1]...)
-	part2 = append(part2, ',')
-	part3 := mustMarshal(config[10:])
-	part3 = append([]byte(","), part3[1:]...)
-	for i := 0; i < limit; i++ {
-		finalJSON := bytes.Join([][]byte{
-			part1,
-			[]byte(fmt.Sprint(i)),
-			part2,
-			[]byte(fmt.Sprint(i >> 1)),
-			part3,
-		}, nil)
-		encoded := []byte(base64.StdEncoding.EncodeToString(finalJSON))
-		hash := sha3.Sum512(append(seedBytes, encoded...))
-		if bytes.Compare(hash[:diffLen], target) <= 0 {
-			return string(encoded), true
+	var config []any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		return "", fmt.Errorf("parse requirements token: %w", err)
+	}
+	if len(config) != 25 {
+		return "", fmt.Errorf("requirements token has %d fields, want 25", len(config))
+	}
+	difficulty = sanitizeDifficulty(difficulty)
+	for i := 0; i < powMaxAttempts; i++ {
+		config[3] = i
+		config[9] = i >> 1
+		payload := encodePOWPayload(config)
+		if powSatisfies(fnv1a32(seed+payload), difficulty) {
+			return "gAAAAAB" + payload + "~S", nil
 		}
 	}
-	return "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + base64.StdEncoding.EncodeToString([]byte(`"`+seed+`"`)), false
+	return "", fmt.Errorf("failed to solve proof token: difficulty=%s", difficulty)
 }
 
-func mustMarshal(v any) []byte {
-	data, _ := json.Marshal(v)
-	return data
+// sanitizeDifficulty keeps only the hex digits the challenge program sent.
+func sanitizeDifficulty(difficulty string) string {
+	return difficultySanitizeRE.ReplaceAllString(difficulty, "")
+}
+
+// fnv1a32 is the current sentinel proof-of-work hash: FNV-1a 32 bit over the
+// UTF-16 code units of the input, then a murmur3 style avalanche, rendered as
+// eight hex digits.
+func fnv1a32(text string) string {
+	hash := uint32(2166136261)
+	// The challenge program hashes UTF-16 code units, matching JS charCodeAt.
+	for _, unit := range utf16.Encode([]rune(text)) {
+		hash ^= uint32(unit)
+		hash *= 16777619
+	}
+	hash ^= hash >> 16
+	hash *= 2246822507
+	hash ^= hash >> 13
+	hash *= 3266489909
+	hash ^= hash >> 16
+	return fmt.Sprintf("%08x", hash)
+}
+
+// powSatisfies reports whether a hash meets the difficulty, comparing the same
+// number of leading hex digits the challenge program asked for.
+func powSatisfies(hashHex, difficulty string) bool {
+	difficulty = sanitizeDifficulty(difficulty)
+	if difficulty == "" {
+		return true
+	}
+	if len(hashHex) < len(difficulty) {
+		return hashHex <= difficulty
+	}
+	return hashHex[:len(difficulty)] <= difficulty
 }
 
 func randomChoice(items []string) string {
