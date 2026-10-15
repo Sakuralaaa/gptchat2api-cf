@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"chatgpt2api/internal/util"
 
@@ -27,6 +28,13 @@ import (
 const (
 	officialPreparePath = "/backend-api/f/conversation/prepare"
 	officialStreamPath  = "/backend-api/f/conversation"
+
+	// clientCreatedRoot is the literal parent_message_id the web client sends for a
+	// brand new image turn; upstream accepts it in place of a real message id.
+	clientCreatedRoot = "client-created-root"
+	// imageCreationMention is the ecosystem mention the web client prefixes image
+	// prompts with.
+	imageCreationMention = "@创建图像"
 
 	ResponsesImageMainModel      = "gpt-5.4-mini"
 	ResponsesImageCodexToolModel = "gpt-5.4-mini"
@@ -744,34 +752,49 @@ func (c *Client) officialHeaders(path string, reqs ChatRequirements, conduitToke
 	if strings.TrimSpace(conduitToken) != "" {
 		extra["X-Conduit-Token"] = conduitToken
 	}
-	if accept == "text/event-stream" {
+	// prepare and the follow-up conversation must share the same turn trace id.
+	if traceID := strings.TrimSpace(c.imageTurnTraceID); traceID != "" {
+		extra["X-Oai-Turn-Trace-Id"] = traceID
+	} else if accept == "text/event-stream" {
 		extra["X-Oai-Turn-Trace-Id"] = util.NewUUID()
 	}
 	return c.headers(path, extra)
 }
 
+// officialImageClientContext mirrors the client_contextual_info the web client
+// sends for image turns (2026-10 capture).
+func officialImageClientContext() map[string]any {
+	return map[string]any{
+		"app_name":                         "chatgpt.com",
+		"app_surface":                      "codex_browser",
+		"has_web_push_capabilities":        true,
+		"web_push_notification_permission": "default",
+	}
+}
+
 func (c *Client) prepareOfficialImageConversation(ctx context.Context, prompt string, reqs ChatRequirements, request ResponsesImageRequest) (string, error) {
-	parentMessageID := firstNonEmpty(strings.TrimSpace(request.ParentMessageID), util.NewUUID())
+	// prepare and the follow-up /backend-api/f/conversation call must share one
+	// x-oai-turn-trace-id, like the web client does.
+	c.imageTurnTraceID = util.NewUUID()
 	payload := map[string]any{
-		"action":                "next",
-		"fork_from_shared_post": false,
-		"parent_message_id":     parentMessageID,
-		"model":                 officialImageModelSlug(request.Model),
-		"client_prepare_state":  "success",
-		"timezone_offset_min":   c.conversationTimezoneOffsetMin(),
-		"timezone":              c.conversationTimezoneName(),
-		"conversation_mode":     map[string]any{"kind": "primary_assistant"},
-		"system_hints":          []any{"picture_v2"},
+		"action":                  "next",
+		"is_do_not_remember":      false,
+		"parent_message_id":       officialImageParentMessageID(request.ParentMessageID),
+		"model":                   officialImageModelSlug(request.Model),
+		"client_prepare_state":    "sent",
+		"client_prepare_dispatch": "debounced",
+		"client_prepare_source":   "composer_editor_state",
+		"timezone_offset_min":     c.conversationTimezoneOffsetMin(),
+		"timezone":                c.conversationTimezoneName(),
+		"system_hints":            []any{"picture_v2"},
 		"partial_query": map[string]any{
 			"id":      util.NewUUID(),
 			"author":  map[string]any{"role": "user"},
 			"content": map[string]any{"content_type": "text", "parts": []any{prompt}},
 		},
-		"supports_buffering":  true,
-		"supported_encodings": []any{"v1"},
-		"client_contextual_info": map[string]any{
-			"app_name": "chatgpt.com",
-		},
+		"local_function_names":   []any{"local.continue_in_work"},
+		"supported_encodings":    []any{"v1"},
+		"client_contextual_info": officialImageClientContext(),
 	}
 	if conversationID := strings.TrimSpace(request.ConversationID); conversationID != "" {
 		payload["conversation_id"] = conversationID
@@ -803,22 +826,24 @@ func (c *Client) prepareOfficialImageConversation(ctx context.Context, prompt st
 	return token, nil
 }
 
+// officialImageParentMessageID returns the parent_message_id to send for an image
+// turn. The web client uses the literal "client-created-root" for a brand new turn
+// instead of a generated UUID.
+func officialImageParentMessageID(requested string) string {
+	return firstNonEmpty(strings.TrimSpace(requested), clientCreatedRoot)
+}
+
+// officialImageModelSlug maps a client-facing image model to the slug the official
+// image pipeline submits upstream. The web client sends "auto" for the whole
+// gpt-image-2 family and lets the server pick the current model: pinning a concrete
+// slug (previously gpt-5-5) breaks the moment upstream retires it, and an unknown
+// slug makes /prepare answer conduit_token: null, so the follow-up
+// /backend-api/f/conversation only returns a disguised 404 Model not found.
 func officialImageModelSlug(model string) string {
-	switch strings.TrimSpace(model) {
-	case util.ImageModelGPT:
-		return "gpt-5-5"
-	case util.ImageModelGPT25, util.ImageModelGPT25Flare, util.ImageModelGPT25Sunburst:
-		// 上游只认 auto / gpt-5-5 / codex-gpt-image-2 这些 slug：提交未知 slug 时
-		// prepare 会返回 conduit_token: null，随后的 /backend-api/f/conversation
-		// 只会回一个伪装成 404 的 {"detail":"Model not found"}。
-		return "gpt-5-5"
-	case util.ImageModelCodex:
+	if strings.TrimSpace(model) == util.ImageModelCodex {
 		return util.ImageModelCodex
-	case "", util.ImageModelAuto:
-		return "auto"
-	default:
-		return "auto"
 	}
+	return util.ImageModelAuto
 }
 
 func (c *Client) uploadImage(ctx context.Context, input ResponsesInputImage, fileName string) (uploadedImageRef, error) {
@@ -905,6 +930,7 @@ func (c *Client) uploadImage(ctx context.Context, input ResponsesInputImage, fil
 }
 
 func (c *Client) startOfficialImageConversation(ctx context.Context, prompt string, reqs ChatRequirements, conduitToken string, request ResponsesImageRequest, refs []uploadedImageRef, maskRef *uploadedImageRef) (*http.Response, error) {
+	mentionText := imageCreationMention + " " + prompt
 	parts := make([]any, 0, len(refs)+2)
 	for _, ref := range refs {
 		parts = append(parts, map[string]any{
@@ -915,8 +941,8 @@ func (c *Client) startOfficialImageConversation(ctx context.Context, prompt stri
 			"size_bytes":    ref.FileSize,
 		})
 	}
-	parts = append(parts, prompt)
-	content := map[string]any{"content_type": "text", "parts": []any{prompt}}
+	parts = append(parts, mentionText)
+	content := map[string]any{"content_type": "text", "parts": []any{mentionText}}
 	if len(refs) > 0 {
 		content = map[string]any{"content_type": "multimodal_text", "parts": parts}
 	}
@@ -925,7 +951,15 @@ func (c *Client) startOfficialImageConversation(ctx context.Context, prompt stri
 		"selected_github_repos":        []any{},
 		"selected_all_github_repos":    false,
 		"system_hints":                 []any{"picture_v2"},
-		"serialization_metadata":       map[string]any{"custom_symbol_offsets": []any{}},
+		"serialization_metadata": map[string]any{
+			"render_format": "markdown",
+			"custom_symbol_offsets": []any{map[string]any{
+				"id":         "picture_v2",
+				"symbol":     "ecosystemMention",
+				"startIndex": 0,
+				"endIndex":   utf8.RuneCountInString(imageCreationMention),
+			}},
+		},
 	}
 	if len(refs) > 0 {
 		attachments := make([]map[string]any, 0, len(refs))
@@ -953,40 +987,36 @@ func (c *Client) startOfficialImageConversation(ctx context.Context, prompt stri
 		content["mask_pointer"] = "file-service://" + maskRef.FileID
 	}
 	userMessageID := util.NewUUID()
-	parentMessageID := firstNonEmpty(strings.TrimSpace(request.ParentMessageID), util.NewUUID())
+	parentMessageID := officialImageParentMessageID(request.ParentMessageID)
 	payload := map[string]any{
-		"action": "next",
+		"turn_attribution":   map[string]any{"turn_trigger": "composer"},
+		"action":             "next",
+		"is_do_not_remember": false,
 		"messages": []any{
 			map[string]any{
 				"id":          userMessageID,
-				"author":      map[string]any{"role": "user"},
+				"author":      map[string]any{"metadata": map[string]any{}, "name": nil, "role": "user"},
+				"channel":     nil,
 				"create_time": float64(time.Now().UnixNano()) / 1e9,
+				"end_turn":    nil,
 				"content":     content,
 				"metadata":    metadata,
+				"recipient":   "all",
+				"status":      "finished_successfully",
+				"update_time": nil,
+				"weight":      1,
 			},
 		},
-		"parent_message_id":                    parentMessageID,
-		"model":                                officialImageModelSlug(request.Model),
-		"client_prepare_state":                 "sent",
-				"timezone_offset_min":                  c.conversationTimezoneOffsetMin(),
-				"timezone":                             c.conversationTimezoneName(),
-		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
-		"enable_message_followups":             true,
-		"system_hints":                         []any{"picture_v2"},
-		"supports_buffering":                   true,
-		"supported_encodings":                  []any{"v1"},
-		"paragen_cot_summary_display_override": "allow",
-		"force_parallel_switch":                "auto",
-		"client_contextual_info": map[string]any{
-			"is_dark_mode":      false,
-			"time_since_loaded": 1200,
-			"page_height":       1072,
-			"page_width":        1724,
-			"pixel_ratio":       1.2,
-			"screen_height":     1440,
-			"screen_width":      2560,
-			"app_name":          "chatgpt.com",
-		},
+		"parent_message_id":      parentMessageID,
+		"model":                  officialImageModelSlug(request.Model),
+		"system_hints":           []any{"picture_v2"},
+		"timezone_offset_min":    c.conversationTimezoneOffsetMin(),
+		"timezone":               c.conversationTimezoneName(),
+		"client_contextual_info": officialImageClientContext(),
+		"local_function_names":   []any{"local.continue_in_work"},
+		"supported_encodings":    []any{"v1"},
+		"genui_state_snapshots":  []any{},
+		"client_prepare_state":   "success",
 	}
 	headers := c.officialHeaders(officialStreamPath, reqs, conduitToken, "text/event-stream")
 	if conversationID := strings.TrimSpace(request.ConversationID); conversationID != "" {

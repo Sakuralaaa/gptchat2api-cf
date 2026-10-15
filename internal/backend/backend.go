@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -53,6 +54,10 @@ type Client struct {
 	sessionID    string
 	powSources   []string
 	powDataBuild string
+
+	// imageTurnTraceID is shared by the official image prepare call and the
+	// follow-up /backend-api/f/conversation call, like the web client does.
+	imageTurnTraceID string
 	timezone          powTimezone
 	timezoneMu        sync.Mutex
 	timezoneExpiresAt time.Time
@@ -353,7 +358,6 @@ func (c *Client) headers(path string, extra map[string]string) map[string]string
 		"OAI-Language":                "zh-CN",
 		"OAI-Client-Version":          c.ClientVersion,
 		"OAI-Client-Build-Number":     c.ClientBuildNumber,
-		"X-OpenAI-Target-Path":        path,
 		"X-OpenAI-Target-Route":       path,
 	}
 	if c.AccessToken != "" {
@@ -470,8 +474,12 @@ func (c *Client) getChatRequirements(ctx context.Context) (ChatRequirements, err
 	}
 
 	turnstileToken := ""
-	if turnstile := util.StringMap(prepareData["turnstile"]); util.ToBool(turnstile["required"]) && util.Clean(turnstile["dx"]) != "" {
-		turnstileToken = c.solveTurnstileChallenge(ctx, util.Clean(turnstile["dx"]), p)
+	if turnstile := util.StringMap(prepareData["turnstile"]); util.ToBool(turnstile["required"]) {
+		token, err := c.solveTurnstileChallenge(ctx, util.Clean(turnstile["dx"]), p, prepareData)
+		if err != nil {
+			return ChatRequirements{}, err
+		}
+		turnstileToken = token
 	}
 
 	finalizePath := base + "/finalize"
@@ -488,6 +496,10 @@ func (c *Client) getChatRequirements(ctx context.Context) (ChatRequirements, err
 	if err != nil {
 		return ChatRequirements{}, err
 	}
+	// finalize sets a restricted cookie that the follow-up conversation requests
+	// must not carry: leaving it in the jar makes upstream answer the disguised
+	// "Model not found" 404.
+	c.dropRestrictedCookies()
 
 	reqs := ChatRequirements{
 		Token:          util.Clean(data["token"]),
@@ -503,6 +515,29 @@ func (c *Client) getChatRequirements(ctx context.Context) (ChatRequirements, err
 		return ChatRequirements{}, fmt.Errorf("missing chat requirements token: %v", data)
 	}
 	return reqs, nil
+}
+
+// dropRestrictedCookies removes the oai-sc cookie the sentinel finalize step
+// sets. Leaving it in the jar makes the follow-up conversation requests carry it,
+// and upstream then answers the disguised 404 {"detail":"Model not found"}.
+func (c *Client) dropRestrictedCookies() {
+	if c.httpClient == nil || c.httpClient.Jar == nil {
+		return
+	}
+	cookieURL, err := url.Parse(c.BaseURL + "/")
+	if err != nil {
+		return
+	}
+	for _, cookie := range c.httpClient.Jar.Cookies(cookieURL) {
+		if cookie.Name != "oai-sc" {
+			continue
+		}
+		cleared := *cookie
+		cleared.Value = ""
+		cleared.MaxAge = -1
+		cleared.Expires = time.Unix(0, 0)
+		c.httpClient.Jar.SetCookies(cookieURL, []*http.Cookie{&cleared})
+	}
 }
 
 // decodeJSONResponse drains a JSON response, turning a non-2xx status into an

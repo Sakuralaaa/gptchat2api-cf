@@ -138,11 +138,79 @@ async function readPageProfile(page) {
 const REFRESH_SECONDS = Math.max(60, parseInt(process.env.SENTINEL_SOLVER_REFRESH_SECONDS || '1800', 10) || 1800);
 const HEADLESS = !['0', 'false', 'no'].includes((process.env.SENTINEL_SOLVER_HEADLESS || 'true').trim().toLowerCase());
 const READY_TIMEOUT_MS = 60000;
+// 页面自带的 turnstile 模块首次使用要 fetch/parse，给它留足时间；页面打开时已预热。
+const SDK_SOLVE_TIMEOUT_MS = 45000;
+const VM_SOLVE_TIMEOUT_MS = 20000;
 const PORT = parseInt(process.env.PORT || '8080', 10) || 8080;
 
 const log = (...args) => console.log('[sentinel-solver]', new Date().toISOString(), ...args);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const errText = (err) => String((err && err.message) || err);
+
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
+// 首选路径：直接 import chatgpt.com 页面自己加载的 turnstile chunk，在真实页面环境里调
+// getEnforcementToken。手写 VM 只能作回退 —— 它得跟着前端版本走，而调用官方模块不用。
+// chunk 文件名带内容哈希、每次发版都变，所以求解时动态发现，不写死。
+const PINNED_TURNSTILE_ASSET = '/unauth-mweb/assets/turnstile-DykPLDEM.js';
+const DISCOVER_TURNSTILE_ASSET = `() => {
+  const pattern = /\\/turnstile-[^/"']+\\.js/;
+  const seen = [];
+  const push = (url) => { if (url && pattern.test(url) && !seen.includes(url)) seen.push(url); };
+  try { performance.getEntriesByType('resource').forEach((e) => push(e.name)); } catch (err) {}
+  try { Array.from(document.scripts).forEach((s) => push(s.src)); } catch (err) {}
+  return seen;
+}`;
+const SCAN_TURNSTILE_ASSET_IN_SCRIPTS = `async (pattern) => {
+  const re = new RegExp(pattern);
+  for (const script of Array.from(document.scripts)) {
+    if (!script.src) continue;
+    try {
+      const text = await (await fetch(script.src)).text();
+      const hit = text.match(re);
+      if (hit) return hit[0];
+    } catch (err) {}
+  }
+  return null;
+}`;
+const SOLVE_TURNSTILE_VIA_SDK = `async ([requirements, key, asset]) => {
+  try {
+    const mod = await import(asset);
+    const turnstile = mod.turnstile || (mod.default && mod.default.turnstile);
+    if (!turnstile || typeof turnstile.getEnforcementToken !== 'function') {
+      return 'ERR:getEnforcementToken missing';
+    }
+    // SDK 在 WeakMap 里按 requirements 对象查它自己的 seed，这里喂 p token。
+    const original = WeakMap.prototype.get;
+    WeakMap.prototype.get = function (target) {
+      return target === requirements ? key : original.call(this, target);
+    };
+    try {
+      return String(await turnstile.getEnforcementToken(requirements));
+    } finally {
+      WeakMap.prototype.get = original;
+    }
+  } catch (error) {
+    return 'ERR:' + String(error).slice(0, 300);
+  }
+}`;
+const SOLVE_TURNSTILE_VIA_VM = `([dx, p]) => window.__sentinelVM.turnstile(dx, p)`;
+const WARM_TURNSTILE_ASSET = `async (asset) => {
+  try {
+    const mod = await import(asset);
+    return !!(mod.turnstile || (mod.default && mod.default.turnstile));
+  } catch (err) {
+    return false;
+  }
+}`;
 
 /** JS getTimezoneOffset() 语义：本地时间到 UTC 的分钟差（西半球为正）。 */
 function timezoneOffsetMinutes(timeZone) {
@@ -188,6 +256,7 @@ class SolverPage {
     this.userAgent = USER_AGENT;
     this.lastError = '';
     this.profile = null;
+    this.turnstileAssetPath = '';
     this.lock = Promise.resolve();
   }
 
@@ -210,6 +279,8 @@ class SolverPage {
     log('browser launched', JSON.stringify({ version: this.browser.version(), user_agent: this.userAgent, timezone: TIMEZONE || null, proxy: PROXY ? '(set)' : null }));
     try {
       await this.ensurePage();
+      // 页面一就绪就发现并 import 一次页面自带的 turnstile chunk，首个求解请求不用等它下载解析。
+      await this.resolveTurnstileAsset();
     } catch (err) {
       // 启动时页面暂时打不开不致命，首个请求会重试
       this.lastError = errText(err);
@@ -290,12 +361,16 @@ class SolverPage {
     }
   }
 
-  /** 在页面里执行；页面失效时重开一次再试。 */
-  async evaluate(expression, arg) {
+  /** 在页面里执行；页面失效时重开一次再试。timeoutMs > 0 时给单次调用加超时。 */
+  async evaluate(expression, arg, timeoutMs) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const page = await this.ensurePage();
       try {
-        return await page.evaluate(expression, arg);
+        const result = page.evaluate(expression, arg);
+        if (timeoutMs > 0) {
+          return await withTimeout(result, timeoutMs, `page.evaluate timed out after ${timeoutMs}ms`);
+        }
+        return await result;
       } catch (err) {
         this.lastError = errText(err);
         if (attempt) throw err;
@@ -303,6 +378,72 @@ class SolverPage {
       }
     }
     throw new Error('unreachable');
+  }
+  /** 定位 chatgpt.com 自己加载的 turnstile chunk：先看页面已加载资源，再扫页面脚本。 */
+  async resolveTurnstileAsset() {
+    if (this.turnstileAssetPath) return this.turnstileAssetPath;
+    try {
+      const loaded = await this.evaluate(DISCOVER_TURNSTILE_ASSET, null, SDK_SOLVE_TIMEOUT_MS);
+      if (Array.isArray(loaded) && loaded.length) {
+        this.turnstileAssetPath = String(loaded[0]);
+        log('turnstile asset (loaded):', this.turnstileAssetPath);
+        await this.warmTurnstileAsset(this.turnstileAssetPath);
+        return this.turnstileAssetPath;
+      }
+      const scanned = await this.evaluate(
+        SCAN_TURNSTILE_ASSET_IN_SCRIPTS,
+        '/unauth-mweb/assets/turnstile-[A-Za-z0-9_-]+\\.js',
+        SDK_SOLVE_TIMEOUT_MS
+      );
+      if (scanned) {
+        this.turnstileAssetPath = String(scanned);
+        log('turnstile asset (scanned):', this.turnstileAssetPath);
+        await this.warmTurnstileAsset(this.turnstileAssetPath);
+        return this.turnstileAssetPath;
+      }
+    } catch (err) {
+      this.lastError = errText(err);
+    }
+    log('turnstile asset discovery fell back to', PINNED_TURNSTILE_ASSET);
+    this.turnstileAssetPath = PINNED_TURNSTILE_ASSET;
+    return this.turnstileAssetPath;
+  }
+
+  /** 提前 import 一次页面自带的 turnstile 模块，把它预热进模块缓存。 */
+  async warmTurnstileAsset(asset) {
+    try {
+      const ready = await this.evaluate(WARM_TURNSTILE_ASSET, asset, SDK_SOLVE_TIMEOUT_MS);
+      log(`turnstile asset warm-up ${ready ? 'ok' : 'failed'}:`, asset);
+    } catch (err) {
+      this.lastError = errText(err);
+    }
+  }
+
+  /** 优先用页面自带的 turnstile 模块求解，失败再回退内置 VM。 */
+  async solveTurnstile(requirements, dx, p) {
+    if (requirements) {
+      const asset = await this.resolveTurnstileAsset();
+      let result = '';
+      try {
+        result = String((await this.evaluate(SOLVE_TURNSTILE_VIA_SDK, [requirements, p, asset], SDK_SOLVE_TIMEOUT_MS)) || '');
+      } catch (err) {
+        result = 'ERR:' + errText(err);
+      }
+      if (result && !result.startsWith('ERR:')) {
+        return { ok: true, token: result };
+      }
+      this.lastError = result.slice(0, 300);
+      log(`SDK solve failed via ${asset}: ${result.slice(0, 300)}`);
+      // 丢掉缓存的 asset 和页面，下次重新发现。
+      this.turnstileAssetPath = '';
+      await this.invalidate();
+    }
+    if (!dx) {
+      return { ok: false, token: this.lastError || 'no dx and no requirements supplied' };
+    }
+    const result = String((await this.evaluate(SOLVE_TURNSTILE_VIA_VM, [dx, p], VM_SOLVE_TIMEOUT_MS)) || '');
+    if (result.startsWith('ERR:')) return { ok: false, token: result.slice(4) };
+    return { ok: !!result, token: result };
   }
 
   status() {
@@ -390,16 +531,18 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const dx = String(body.dx || '');
       const p = String(body.p || '');
-      if (!dx) {
-        send(res, 400, { detail: 'dx is required' });
+      // requirements 是 prepare 的完整响应，纯挑战参数：有了它就调用页面自带的 turnstile 模块。
+      const requirements = body.requirements && typeof body.requirements === 'object' ? body.requirements : null;
+      if (!dx && !requirements) {
+        send(res, 400, { detail: 'dx or requirements is required' });
         return;
       }
-      const token = await solver.evaluate(([value, key]) => window.__sentinelVM.turnstile(value, key), [dx, p]);
-      const value = token == null ? '' : String(token);
-      const failure = tokenFailure(value);
-      log(`turnstile dx_len=${dx.length} p_len=${p.length} token_len=${value.length}${failure ? ` FAILED=${failure.slice(0, 200)}` : ''}`);
+      const outcome = await solver.solveTurnstile(requirements, dx, p);
+      const value = outcome.token == null ? '' : String(outcome.token);
+      const failure = outcome.ok ? tokenFailure(value) : value;
+      log(`turnstile dx_len=${dx.length} p_len=${p.length} via_sdk=${requirements ? 'yes' : 'no'} token_len=${value.length}${failure ? ` FAILED=${String(failure).slice(0, 200)}` : ''}`);
       if (failure) {
-        send(res, 502, { detail: `turnstile solve failed: ${failure.slice(0, 300)}` });
+        send(res, 502, { detail: `turnstile solve failed: ${String(failure).slice(0, 300)}` });
         return;
       }
       send(res, 200, { token: value });

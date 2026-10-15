@@ -139,7 +139,7 @@ func TestOfficialImageHeadersIncludeSentinelAndConduitTokens(t *testing.T) {
 		"X-Conduit-Token":                         "conduit-token",
 		"Accept":                                  "text/event-stream",
 		"Content-Type":                            "application/json",
-		"X-OpenAI-Target-Path":                    officialStreamPath,
+		"X-OpenAI-Target-Route":                   officialStreamPath,
 	} {
 		if got := headers[key]; got != want {
 			t.Fatalf("headers[%s] = %q, want %q", key, got, want)
@@ -163,22 +163,33 @@ func TestBuildOfficialImagePromptOnlyAddsSizeHint(t *testing.T) {
 }
 
 func TestOfficialImageModelSlug(t *testing.T) {
+	// The web client sends "auto" for the whole gpt-image-2 family: a pinned slug
+	// (gpt-5-5) breaks as soon as upstream retires it.
 	for _, tt := range []struct {
 		model string
 		want  string
 	}{
 		{model: "", want: "auto"},
 		{model: "auto", want: "auto"},
-		{model: "gpt-image-2", want: "gpt-5-5"},
-		{model: "gpt-image-2.5", want: "gpt-5-5"},
-		{model: "gpt-image-2.5-flare", want: "gpt-5-5"},
-		{model: "gpt-image-2.5-sunburst", want: "gpt-5-5"},
+		{model: "gpt-image-2", want: "auto"},
+		{model: "gpt-image-2.5", want: "auto"},
+		{model: "gpt-image-2.5-flare", want: "auto"},
+		{model: "gpt-image-2.5-sunburst", want: "auto"},
 		{model: "codex-gpt-image-2", want: "codex-gpt-image-2"},
 		{model: "gpt-5.5", want: "auto"},
 	} {
 		if got := officialImageModelSlug(tt.model); got != tt.want {
 			t.Fatalf("officialImageModelSlug(%q) = %q, want %q", tt.model, got, tt.want)
 		}
+	}
+}
+
+func TestOfficialImageParentMessageIDUsesClientCreatedRoot(t *testing.T) {
+	if got := officialImageParentMessageID(""); got != "client-created-root" {
+		t.Fatalf("officialImageParentMessageID(%q) = %q", "", got)
+	}
+	if got := officialImageParentMessageID("  parent-1  "); got != "parent-1" {
+		t.Fatalf("officialImageParentMessageID() = %q", got)
 	}
 }
 
@@ -287,11 +298,11 @@ func TestStreamResponsesImageUsesOfficialPrepareAndConversationRoutes(t *testing
 	if results[0].Result != png1x1 {
 		t.Fatalf("result = %q, want %q", results[0].Result, png1x1)
 	}
-	if prepareBody["model"] != "gpt-5-5" {
-		t.Fatalf("prepare model = %#v, want gpt-5-5", prepareBody["model"])
+	if prepareBody["model"] != "auto" {
+		t.Fatalf("prepare model = %#v, want auto", prepareBody["model"])
 	}
-	if streamBody["model"] != "gpt-5-5" {
-		t.Fatalf("stream model = %#v, want gpt-5-5", streamBody["model"])
+	if streamBody["model"] != "auto" {
+		t.Fatalf("stream model = %#v, want auto", streamBody["model"])
 	}
 	messages := streamBody["messages"].([]any)
 	message := messages[0].(map[string]any)
@@ -1283,7 +1294,7 @@ func TestResolveOfficialImageResultsRetriesTransientDownloadURL404(t *testing.T)
 			if got := r.URL.Query().Get("inline"); got != "false" {
 				t.Fatalf("inline = %q", got)
 			}
-			if got := r.Header.Get("X-OpenAI-Target-Path"); got != "/backend-api/files/download/file_img" {
+			if got := r.Header.Get("X-OpenAI-Target-Route"); got != "/backend-api/files/download/file_img" {
 				t.Fatalf("target path = %q", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -1344,7 +1355,7 @@ func TestResolveOfficialImageResultsUsesConversationScopedFileDownloadForSedimen
 			if got := r.URL.Query().Get("inline"); got != "false" {
 				t.Fatalf("inline = %q", got)
 			}
-			if got := r.Header.Get("X-OpenAI-Target-Path"); got != "/backend-api/files/download/file_img" {
+			if got := r.Header.Get("X-OpenAI-Target-Route"); got != "/backend-api/files/download/file_img" {
 				t.Fatalf("target path = %q", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -1393,7 +1404,7 @@ func TestResolveOfficialImageResultsAuthenticatesBackendDownloadURL(t *testing.T
 			if got := r.Header.Get("Authorization"); got != "Bearer token-1" {
 				t.Fatalf("Authorization = %q", got)
 			}
-			if got := r.Header.Get("X-OpenAI-Target-Path"); got != "/backend-api/estuary/content" {
+			if got := r.Header.Get("X-OpenAI-Target-Route"); got != "/backend-api/estuary/content" {
 				t.Fatalf("target path = %q", got)
 			}
 			if got := r.Header.Get("Accept"); got != "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8" {

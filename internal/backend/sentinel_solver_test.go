@@ -38,6 +38,9 @@ func TestSentinelSolverClientHealthAndTurnstile(t *testing.T) {
 			if body["dx"] != "dx-1" || body["p"] != "p-1" {
 				t.Errorf("turnstile body = %#v", body)
 			}
+			if body["requirements"] == nil {
+				t.Errorf("turnstile body is missing the prepare response: %#v", body)
+			}
 			_, _ = w.Write([]byte(`{"token":"turnstile-1"}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -56,7 +59,7 @@ func TestSentinelSolverClientHealthAndTurnstile(t *testing.T) {
 	if !ok || name != "America/Phoenix" || offsetMin != 420 || longName != "Mountain Standard Time" {
 		t.Fatalf("TimezoneInfo() = %q, %d, %q, %v", name, offsetMin, longName, ok)
 	}
-	token, err := solver.SolveTurnstile(context.Background(), "dx-1", "p-1")
+	token, err := solver.SolveTurnstile(context.Background(), "dx-1", "p-1", map[string]any{"prepare_token": "prep-1"})
 	if err != nil || token != "turnstile-1" {
 		t.Fatalf("SolveTurnstile() = %q, %v", token, err)
 	}

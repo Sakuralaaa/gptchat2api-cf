@@ -25,7 +25,9 @@ const (
 	// do not probe a dead service on every single request.
 	sentinelSolverHealthTTL      = 10 * time.Minute
 	sentinelSolverHealthErrorTTL = 30 * time.Second
-	sentinelSolverRequestTimeout = 40 * time.Second
+	// The page's own turnstile module may need to fetch and parse its chunk on
+	// first use, so the solver gets more room than a plain health probe.
+	sentinelSolverRequestTimeout = 75 * time.Second
 )
 
 type sentinelSolverHealth struct {
@@ -177,8 +179,16 @@ func (s *sentinelSolverClient) TimezoneInfo(ctx context.Context) (string, int, s
 	return strings.TrimSpace(health.Timezone), *health.TimezoneOffsetMin, strings.TrimSpace(health.TimezoneLongName), true
 }
 
-func (s *sentinelSolverClient) SolveTurnstile(ctx context.Context, dx, p string) (string, error) {
-	data, status, err := s.do(ctx, http.MethodPost, "/v1/turnstile", map[string]any{"dx": dx, "p": p})
+func (s *sentinelSolverClient) SolveTurnstile(ctx context.Context, dx, p string, requirements map[string]any) (string, error) {
+	body := map[string]any{"dx": dx, "p": p}
+	if len(requirements) > 0 {
+		// The whole prepare response is pure challenge material (prepare token, dx,
+		// proof-of-work seed, SO handle): handing it over lets the solver call the
+		// page's own Turnstile module, which is the only path the current challenge
+		// accepts. No account token, cookie or prompt is ever sent here.
+		body["requirements"] = requirements
+	}
+	data, status, err := s.do(ctx, http.MethodPost, "/v1/turnstile", body)
 	if err != nil {
 		return "", fmt.Errorf("sentinel solver turnstile: %w", err)
 	}
@@ -240,13 +250,23 @@ func (c *Client) sentinelUserAgent(ctx context.Context) string {
 // solveTurnstileChallenge computes the Turnstile token for the challenge
 // program dx. It prefers the resident-browser solver service and falls back to
 // the in-process VM, which lags behind newer challenge programs.
-func (c *Client) solveTurnstileChallenge(ctx context.Context, dx, p string) string {
+// solveTurnstileChallenge computes the Turnstile token for the challenge program
+// dx through the resident-browser solver service. It fails closed: the in-process
+// VM cannot produce a token the current challenge accepts, and sending an empty
+// one only buys the disguised "Model not found" 404 plus a wasted retry.
+func (c *Client) solveTurnstileChallenge(ctx context.Context, dx, p string, requirements map[string]any) (string, error) {
 	if solver := c.sentinelSolver(); solver != nil {
-		if token, err := solver.SolveTurnstile(ctx, dx, p); err == nil {
-			return token
+		token, err := solver.SolveTurnstile(ctx, dx, p, requirements)
+		if err != nil {
+			return "", fmt.Errorf("sentinel turnstile solve failed: %w", err)
 		}
+		return token, nil
 	}
-	return solveTurnstileToken(dx, p)
+	// No solver configured: keep the local VM so a bare deployment still works.
+	if strings.TrimSpace(dx) == "" {
+		return "", nil
+	}
+	return solveTurnstileToken(dx, p), nil
 }
 
 // powTimezoneInfo resolves the timezone embedded in sentinel tokens and

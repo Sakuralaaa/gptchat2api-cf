@@ -164,4 +164,42 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  build-solver-main:
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        run: |
+          OWNER_LOWER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER_LOWER}/${{ github.event.repository.name }}-sentinel-solver"
+          echo "tags=${IMAGE}:latest,${IMAGE}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push solver Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: sentinel_solver
+          file: sentinel_solver/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
 
