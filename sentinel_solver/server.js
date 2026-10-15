@@ -367,6 +367,17 @@ function send(res, status, payload) {
   res.end(body);
 }
 
+/** 挑战程序出错时会把错误信息 base64 成 “token”，这里识别出来并当作失败返回。 */
+function tokenFailure(value) {
+  const text = String(value == null ? '' : value);
+  if (!text) return 'empty token';
+  try {
+    const decoded = Buffer.from(text, 'base64').toString('utf8');
+    if (/^\d+:\s/.test(decoded) || /Error/.test(decoded)) return decoded;
+  } catch (err) { /* ignore */ }
+  return '';
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
@@ -384,7 +395,14 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const token = await solver.evaluate(([value, key]) => window.__sentinelVM.turnstile(value, key), [dx, p]);
-      send(res, 200, { token: token == null ? '' : String(token) });
+      const value = token == null ? '' : String(token);
+      const failure = tokenFailure(value);
+      log(`turnstile dx_len=${dx.length} p_len=${p.length} token_len=${value.length}${failure ? ` FAILED=${failure.slice(0, 200)}` : ''}`);
+      if (failure) {
+        send(res, 502, { detail: `turnstile solve failed: ${failure.slice(0, 300)}` });
+        return;
+      }
+      send(res, 200, { token: value });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/v1/so') {
@@ -401,7 +419,14 @@ const server = http.createServer(async (req, res) => {
         ([c, s, key]) => window.__sentinelVM.so(c, s, key),
         [collector, snapshot, p]
       );
-      send(res, 200, { token: token == null ? '' : String(token) });
+      const value = token == null ? '' : String(token);
+      const failure = tokenFailure(value);
+      log(`so collector_len=${collector.length} snapshot_len=${snapshot.length} token_len=${value.length}${failure ? ` FAILED=${failure.slice(0, 200)}` : ''}`);
+      if (failure) {
+        send(res, 502, { detail: `so solve failed: ${failure.slice(0, 300)}` });
+        return;
+      }
+      send(res, 200, { token: value });
       return;
     }
     send(res, 404, { detail: 'not found' });
