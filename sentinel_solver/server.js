@@ -161,8 +161,11 @@ function withTimeout(promise, ms, message) {
 // getEnforcementToken。手写 VM 只能作回退 —— 它得跟着前端版本走，而调用官方模块不用。
 // chunk 文件名带内容哈希、每次发版都变，所以求解时动态发现，不写死。
 const PINNED_TURNSTILE_ASSET = '/unauth-mweb/assets/turnstile-DykPLDEM.js';
-const DISCOVER_TURNSTILE_ASSET = `() => {
-  const re = /\\/turnstile-[^/"'\\s]+?\\.js/g;
+// 注意：下面这些必须是真正的函数，不能是字符串。page.evaluate(string, arg) 只把字符串当
+// 表达式求值并忽略第二个参数，而 `() => {...}` 求值出来是个函数、无法序列化，于是永远返回
+// undefined —— 这正是 solver 一直回 {"token":""} 的原因。
+const discoverTurnstileAssets = () => {
+  const re = /\/turnstile-[^/"'\s]+?\.js/g;
   const seen = [];
   const add = (value) => {
     if (!value) return;
@@ -174,8 +177,9 @@ const DISCOVER_TURNSTILE_ASSET = `() => {
   try { Array.from(document.querySelectorAll('link[href]')).forEach((l) => add(l.href)); } catch (err) {}
   try { add(document.documentElement ? document.documentElement.outerHTML : ''); } catch (err) {}
   return seen;
-}`;
-const SCAN_TURNSTILE_ASSET_IN_SCRIPTS = `async (pattern) => {
+};
+
+const scanScriptsForTurnstileAsset = async (pattern) => {
   const re = new RegExp(pattern);
   for (const script of Array.from(document.scripts)) {
     if (!script.src) continue;
@@ -186,8 +190,9 @@ const SCAN_TURNSTILE_ASSET_IN_SCRIPTS = `async (pattern) => {
     } catch (err) {}
   }
   return null;
-}`;
-const SOLVE_TURNSTILE_VIA_SDK = `async ([requirements, key, asset]) => {
+};
+
+const solveTurnstileViaSdk = async ([requirements, key, asset]) => {
   try {
     const mod = await import(asset);
     const turnstile = mod.turnstile || (mod.default && mod.default.turnstile);
@@ -207,9 +212,11 @@ const SOLVE_TURNSTILE_VIA_SDK = `async ([requirements, key, asset]) => {
   } catch (error) {
     return 'ERR:' + String(error).slice(0, 300);
   }
-}`;
-const SOLVE_TURNSTILE_VIA_VM = `([dx, p]) => window.__sentinelVM.turnstile(dx, p)`;
-const VERIFY_TURNSTILE_ASSET = `async (asset) => {
+};
+
+const solveTurnstileViaVm = ([dx, p]) => window.__sentinelVM.turnstile(dx, p);
+
+const verifyTurnstileAssetInPage = async (asset) => {
   try {
     const r = await fetch(asset, { method: 'GET' });
     const text = await r.text();
@@ -217,15 +224,27 @@ const VERIFY_TURNSTILE_ASSET = `async (asset) => {
   } catch (err) {
     return { error: String(err).slice(0, 200) };
   }
-}`;
-const WARM_TURNSTILE_ASSET = `async (asset) => {
+};
+
+const warmTurnstileAssetInPage = async (asset) => {
   try {
     const mod = await import(asset);
     return !!(mod.turnstile || (mod.default && mod.default.turnstile));
   } catch (err) {
     return false;
   }
-}`;
+};
+
+const pageDebugState = async () => ({
+  title: document.title,
+  host: location.hostname,
+  readyState: document.readyState,
+  vm: typeof window.__sentinelVM,
+  vmTurnstile: window.__sentinelVM ? typeof window.__sentinelVM.turnstile : 'n/a',
+  scriptSrcs: Array.from(document.scripts).map((s) => s.src).filter(Boolean),
+  turnstileish: performance.getEntriesByType('resource').map((e) => e.name).filter((n) => /turnstile|assets\//i.test(n)),
+  htmlTurnstile: (document.documentElement ? document.documentElement.outerHTML : '').match(/\/unauth-mweb\/assets\/turnstile-[A-Za-z0-9_-]+\.js/g),
+});
 
 /** JS getTimezoneOffset() 语义：本地时间到 UTC 的分钟差（西半球为正）。 */
 function timezoneOffsetMinutes(timeZone) {
@@ -399,7 +418,7 @@ class SolverPage {
   async resolveTurnstileAsset() {
     if (this.turnstileAssetPath) return this.turnstileAssetPath;
     try {
-      const loaded = await this.evaluate(DISCOVER_TURNSTILE_ASSET, null, SDK_SOLVE_TIMEOUT_MS);
+      const loaded = await this.evaluate(discoverTurnstileAssets, null, SDK_SOLVE_TIMEOUT_MS);
       if (Array.isArray(loaded) && loaded.length) {
         this.turnstileAssetPath = String(loaded[0]);
         log('turnstile asset (loaded):', this.turnstileAssetPath);
@@ -407,7 +426,7 @@ class SolverPage {
         return this.turnstileAssetPath;
       }
       const scanned = await this.evaluate(
-        SCAN_TURNSTILE_ASSET_IN_SCRIPTS,
+        scanScriptsForTurnstileAsset,
         '/unauth-mweb/assets/turnstile-[A-Za-z0-9_-]+\\.js',
         SDK_SOLVE_TIMEOUT_MS
       );
@@ -430,10 +449,10 @@ class SolverPage {
   /** 提前 import 一次页面自带的 turnstile 模块，把它预热进模块缓存。 */
   async warmTurnstileAsset(asset) {
     try {
-      const check = await this.evaluate(VERIFY_TURNSTILE_ASSET, asset, SDK_SOLVE_TIMEOUT_MS);
+      const check = await this.evaluate(verifyTurnstileAssetInPage, asset, SDK_SOLVE_TIMEOUT_MS);
       log(`turnstile asset check ${JSON.stringify(check)}:`, asset);
       if (check && check.ok) {
-        const ready = await this.evaluate(WARM_TURNSTILE_ASSET, asset, SDK_SOLVE_TIMEOUT_MS);
+        const ready = await this.evaluate(warmTurnstileAssetInPage, asset, SDK_SOLVE_TIMEOUT_MS);
         log(`turnstile asset warm-up ${ready ? 'ok' : 'failed'}:`, asset);
       }
     } catch (err) {
@@ -451,7 +470,7 @@ class SolverPage {
       diag.asset = asset;
       let result = '';
       try {
-        const raw = await this.evaluate(SOLVE_TURNSTILE_VIA_SDK, [requirements, p, asset], SDK_SOLVE_TIMEOUT_MS);
+        const raw = await this.evaluate(solveTurnstileViaSdk, [requirements, p, asset], SDK_SOLVE_TIMEOUT_MS);
         diag.sdkType = typeof raw;
         result = String(raw == null ? '' : raw);
       } catch (err) {
@@ -475,7 +494,7 @@ class SolverPage {
     }
     let vm = '';
     try {
-      const raw = await this.evaluate(SOLVE_TURNSTILE_VIA_VM, [dx, p], VM_SOLVE_TIMEOUT_MS);
+      const raw = await this.evaluate(solveTurnstileViaVm, [dx, p], VM_SOLVE_TIMEOUT_MS);
       diag.vmType = typeof raw;
       vm = String(raw == null ? '' : raw);
     } catch (err) {
@@ -496,20 +515,7 @@ class SolverPage {
       lastSolve: this.lastSolve || null,
     };
     try {
-      out.page = await this.evaluate(
-        `async () => ({
-          title: document.title,
-          host: location.hostname,
-          readyState: document.readyState,
-          vm: typeof window.__sentinelVM,
-          vmTurnstile: window.__sentinelVM ? typeof window.__sentinelVM.turnstile : 'n/a',
-          scriptSrcs: Array.from(document.scripts).map((s) => s.src).filter(Boolean),
-          turnstileish: performance.getEntriesByType('resource').map((e) => e.name).filter((n) => /turnstile|assets\\//i.test(n)),
-          htmlTurnstile: (document.documentElement ? document.documentElement.outerHTML : '').match(/\\/unauth-mweb\\/assets\\/turnstile-[A-Za-z0-9_-]+\\.js/g),
-        })`,
-        null,
-        20000
-      );
+      out.page = await this.evaluate(pageDebugState, null, 20000);
     } catch (err) {
       out.pageError = errText(err);
     }
