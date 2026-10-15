@@ -784,11 +784,23 @@ func (c *Client) prepareOfficialImageConversation(ctx context.Context, prompt st
 	if err := ensureOK(resp, officialPreparePath); err != nil {
 		return "", err
 	}
-	var data map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return "", err
 	}
-	return util.Clean(data["conduit_token"]), nil
+	var data map[string]any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return "", err
+	}
+	token := util.Clean(data["conduit_token"])
+	if token == "" {
+		snippet := strings.TrimSpace(string(raw))
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		return "", fmt.Errorf("conversation prepare returned no conduit token for model %q: %s", officialImageModelSlug(request.Model), snippet)
+	}
+	return token, nil
 }
 
 func officialImageModelSlug(model string) string {
@@ -796,7 +808,10 @@ func officialImageModelSlug(model string) string {
 	case util.ImageModelGPT:
 		return "gpt-5-5"
 	case util.ImageModelGPT25, util.ImageModelGPT25Flare, util.ImageModelGPT25Sunburst:
-		return "gpt-image-2-5"
+		// 上游只认 auto / gpt-5-5 / codex-gpt-image-2 这些 slug：提交未知 slug 时
+		// prepare 会返回 conduit_token: null，随后的 /backend-api/f/conversation
+		// 只会回一个伪装成 404 的 {"detail":"Model not found"}。
+		return "gpt-5-5"
 	case util.ImageModelCodex:
 		return util.ImageModelCodex
 	case "", util.ImageModelAuto:
