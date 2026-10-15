@@ -157,6 +157,10 @@ func (c *Client) StreamConversation(ctx context.Context, messages []map[string]a
 			errCh <- err
 			return
 		}
+		// officialErr remembers why the 2026-10 prepare + /f/conversation path failed.
+		// The legacy endpoint answers a handshake it dislikes with a generic 403, so
+		// reporting only that error hides the real cause.
+		var officialErr error
 		if c.AccessToken != "" {
 			plan := contextoffload.PlanContext(messages, tools, choice, contextoffload.DefaultOptions())
 			offloadMessages := plan.InlineMessages
@@ -175,13 +179,19 @@ func (c *Client) StreamConversation(ctx context.Context, messages []map[string]a
 				}
 			}
 			conduitToken, prepareErr := c.prepareTextConversation(ctx, offloadMessages, reqs, model, attachments)
-			if prepareErr == nil {
+			if prepareErr != nil {
+				officialErr = prepareErr
+			} else {
 				resp, startErr := c.startTextConversation(ctx, offloadMessages, reqs, conduitToken, model, attachments)
-				if startErr == nil {
+				if startErr != nil {
+					officialErr = startErr
+				} else {
 					defer resp.Body.Close()
-					if ensureOK(resp, officialStreamPath) == nil {
+					if err := ensureOK(resp, officialStreamPath); err == nil {
 						errCh <- iterSSEPayloads(ctx, resp.Body, out)
 						return
+					} else {
+						officialErr = err
 					}
 				}
 			}
@@ -195,6 +205,10 @@ func (c *Client) StreamConversation(ctx context.Context, messages []map[string]a
 		}
 		defer resp.Body.Close()
 		if err := ensureOK(resp, path); err != nil {
+			if officialErr != nil {
+				errCh <- fmt.Errorf("%w (%s failed first: %v)", err, officialStreamPath, officialErr)
+				return
+			}
 			errCh <- err
 			return
 		}
