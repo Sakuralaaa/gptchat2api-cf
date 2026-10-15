@@ -199,17 +199,27 @@ const solveTurnstileViaSdk = async ([requirements, key, asset]) => {
     if (!turnstile || typeof turnstile.getEnforcementToken !== 'function') {
       return 'ERR:getEnforcementToken missing';
     }
-    // 这个导出其实是「按 requirements 对象查 WeakMap 缓存」的取值器：正常会把它缓存的
-    // seed 原样返回，所以这里喂 p 只用于把缓存值填上；调用方必须校验返回值不是 seed。
     try {
       window.__solverSdkKeys = { mod: Object.keys(mod), turnstile: Object.keys(turnstile) };
     } catch (err) { /* ignore */ }
+    // 这个导出按 requirements 对象查 WeakMap，同一个对象会被查两次，含义不同：
+    //   第 1 次 =「这个 requirements 算过了吗」的缓存判断。命中就直接返回缓存值，
+    //           所以必须先让它 miss（返回 undefined），否则拿回来的是缓存里的旧值。
+    //   之后的 = 挑战程序解码 dx 用的 XOR key（前端叫 cachedProof，就是 prepare 请求里的 p）。
+    // 上游那版把两次都命中了，于是返回的一直是 p 本身。
     const original = WeakMap.prototype.get;
+    let lookups = 0;
     WeakMap.prototype.get = function (target) {
-      return target === requirements ? key : original.call(this, target);
+      if (target !== requirements) return original.call(this, target);
+      lookups += 1;
+      return lookups === 1 ? undefined : key;
     };
     try {
-      return String(await turnstile.getEnforcementToken(requirements));
+      const token = await turnstile.getEnforcementToken(requirements);
+      try {
+        window.__solverSdkLookups = lookups;
+      } catch (err) { /* ignore */ }
+      return String(token);
     } finally {
       WeakMap.prototype.get = original;
     }
@@ -249,6 +259,7 @@ const pageDebugState = async () => ({
   turnstileish: performance.getEntriesByType('resource').map((e) => e.name).filter((n) => /turnstile|assets\//i.test(n)),
   htmlTurnstile: (document.documentElement ? document.documentElement.outerHTML : '').match(/\/unauth-mweb\/assets\/turnstile-[A-Za-z0-9_-]+\.js/g),
   sdkKeys: window.__solverSdkKeys || null,
+  sdkLookups: typeof window.__solverSdkLookups === "number" ? window.__solverSdkLookups : null,
 });
 
 /** JS getTimezoneOffset() 语义：本地时间到 UTC 的分钟差（西半球为正）。 */
@@ -469,35 +480,15 @@ class SolverPage {
   /**
    * 求解 Turnstile 挑战。
    *
-   * 首选页面内 VM：它和前端的 `_n(chatReq, dx)` 是同一套指令，而且跑在真实 chatgpt.com
-   * 页面上下文里（挑战程序要读 window/document/navigator 等真实属性）。
+   * 首选页面自带 turnstile chunk 的 `getEnforcementToken(requirements)`：它就在真实
+   * chatgpt.com 页面里跑挑战程序，且不需要我们跟着前端版本维护一份 VM 移植。
    *
-   * 页面自带的 turnstile chunk 只作回退：它的 `getEnforcementToken(requirements)` 实际是
-   * 「按 requirements 对象查 WeakMap 缓存」的取值器，会把我们喂进去的 seed 原样返回，
-   * 所以只有返回值既不是 seed、也不是错误串时才采用。
+   * 回退：页面内 VM 移植（和 chunk 同一套指令，但版本漂移时可能算错）。
    */
   async solveTurnstile(requirements, dx, p) {
     const diag = { at: new Date().toISOString(), dxLen: String(dx || '').length, pLen: String(p || '').length, hasRequirements: !!requirements };
     this.lastSolve = diag;
-    if (dx) {
-      let vm = '';
-      try {
-        const raw = await this.evaluate(solveTurnstileViaVm, [dx, p], VM_SOLVE_TIMEOUT_MS);
-        diag.vmType = typeof raw;
-        vm = String(raw == null ? '' : raw);
-      } catch (err) {
-        vm = 'ERR:' + errText(err);
-      }
-      diag.vmLen = vm.length;
-      diag.vmResult = vm.slice(0, 300);
-      if (vm && !vm.startsWith('ERR:')) {
-        diag.via = 'vm';
-        return { ok: true, token: vm };
-      }
-      this.lastError = vm.slice(0, 300);
-      log(`VM turnstile solve failed: ${vm.slice(0, 300)}`);
-    }
-    if (requirements) {
+    if (requirements && dx) {
       const asset = await this.resolveTurnstileAsset();
       diag.asset = asset;
       let result = '';
@@ -510,18 +501,33 @@ class SolverPage {
       }
       diag.sdkResult = result.slice(0, 300);
       diag.sdkLen = result.length;
-      // 取值器会把 seed 原样返回 —— 那不是 token，必须当失败处理。
+      // 返回值等于 p 就说明缓存判断被命中、挑战程序没跑，不能当 token 用。
       if (result && !result.startsWith('ERR:') && result !== String(p)) {
         diag.via = 'sdk';
         return { ok: true, token: result };
       }
       this.lastError = result.slice(0, 300);
-      log(`SDK turnstile fallback unusable via ${asset}: ${result.slice(0, 300)}`);
+      log(`SDK turnstile solve failed via ${asset}: ${result.slice(0, 300)}`);
       this.turnstileAssetPath = '';
       await this.invalidate();
     }
-    diag.via = 'none';
-    return { ok: false, token: this.lastError || 'no dx and no requirements supplied' };
+    if (!dx) {
+      diag.via = 'none';
+      return { ok: false, token: this.lastError || 'no dx and no requirements supplied' };
+    }
+    let vm = '';
+    try {
+      const raw = await this.evaluate(solveTurnstileViaVm, [dx, p], VM_SOLVE_TIMEOUT_MS);
+      diag.vmType = typeof raw;
+      vm = String(raw == null ? '' : raw);
+    } catch (err) {
+      vm = 'ERR:' + errText(err);
+    }
+    diag.vmLen = vm.length;
+    diag.vmResult = vm.slice(0, 300);
+    diag.via = 'vm';
+    if (vm.startsWith('ERR:')) return { ok: false, token: vm.slice(4) };
+    return { ok: !!vm, token: vm };
   }
 
   /** Diagnostics for the live page: what it loaded and how the last solve went. */
