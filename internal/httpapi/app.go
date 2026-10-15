@@ -1110,12 +1110,12 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := body["flaresolverr"]; ok {
 			updates["flaresolverr"] = util.Clean(body["flaresolverr"])
+		}
 		if _, ok := body["sentinel_solver_url"]; ok {
 			updates["sentinel_solver_url"] = util.Clean(body["sentinel_solver_url"])
 		}
 		if _, ok := body["sentinel_solver_key"]; ok {
 			updates["sentinel_solver_key"] = util.Clean(body["sentinel_solver_key"])
-		}
 		}
 		updated, err := a.config.Update(updates)
 		if err != nil {

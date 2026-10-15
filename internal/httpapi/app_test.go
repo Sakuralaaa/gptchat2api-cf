@@ -3495,3 +3495,34 @@ func encodeHTTPTestPNG(file interface {
 	}
 	return png.Encode(file, img)
 }
+
+func TestProxySettingsApplySentinelSolverFieldsIndependently(t *testing.T) {
+	app := newTestApp(t)
+	defer app.Close()
+
+	login := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"`+testAdminUsername+`","password":"`+testAdminPassword+`"}`))
+	loginRes := httptest.NewRecorder()
+	app.Handler().ServeHTTP(loginRes, login)
+	if loginRes.Code != http.StatusOK {
+		t.Fatalf("login status = %d body = %s", loginRes.Code, loginRes.Body.String())
+	}
+	cookie := findResponseCookie(loginRes.Result(), authSessionCookieName)
+	if cookie == nil {
+		t.Fatalf("login cookie missing: %s", loginRes.Body.String())
+	}
+
+	// 只提交 sentinel 字段、不提交 url/flaresolverr：三个分支必须各自独立生效。
+	req := httptest.NewRequest(http.MethodPost, "/api/proxy", strings.NewReader(`{"sentinel_solver_url":"http://sentinel-solver.zeabur.internal:8080/","sentinel_solver_key":"solver-key"}`))
+	req.AddCookie(cookie)
+	res := httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("update proxy status = %d body = %s", res.Code, res.Body.String())
+	}
+	if got := app.config.SentinelSolverURL(); got != "http://sentinel-solver.zeabur.internal:8080" {
+		t.Fatalf("SentinelSolverURL() = %q", got)
+	}
+	if got := app.config.SentinelSolverKey(); got != "solver-key" {
+		t.Fatalf("SentinelSolverKey() = %q", got)
+	}
+}
