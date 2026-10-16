@@ -88,3 +88,22 @@ func TestBrowserHTTPClientPreservesCallerAuthHeaders(t *testing.T) {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
 }
+
+func TestGeckoProfileMatchesFirefoxIdentities(t *testing.T) {
+	for _, tt := range []struct {
+		profile string
+		want    bool
+	}{
+		{profile: "", want: false},
+		{profile: "chrome145", want: false},
+		{profile: "chrome124", want: false},
+		{profile: "edge101", want: false},
+		{profile: "firefox148", want: true},
+		{profile: "Firefox", want: true},
+		{profile: " ff148 ", want: true},
+	} {
+		if got := GeckoProfile(tt.profile); got != tt.want {
+			t.Fatalf("GeckoProfile(%q) = %v, want %v", tt.profile, got, tt.want)
+		}
+	}
+}

@@ -1599,3 +1599,78 @@ func TestSolveTurnstileTokenInterpretsEncodedProgram(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+func TestDefaultBrowserIdentityIsGecko(t *testing.T) {
+	client := &Client{}
+	client.fp = client.buildFingerprint()
+	client.applyBrowserFingerprint()
+	if got := client.fp["impersonate"]; got != firefoxProfile {
+		t.Fatalf("impersonate = %q, want %q", got, firefoxProfile)
+	}
+	if got := client.fp["user-agent"]; got != firefoxUserAgent {
+		t.Fatalf("user-agent = %q, want %q", got, firefoxUserAgent)
+	}
+	for key := range client.fp {
+		if strings.HasPrefix(key, "sec-ch-ua") {
+			t.Fatalf("a Gecko identity must not carry %q: %#v", key, client.fp)
+		}
+	}
+}
+
+func TestGeckoIdentityDropsChromiumClientHints(t *testing.T) {
+	client := &Client{
+		BaseURL:   "https://chatgpt.com",
+		userAgent: firefoxUserAgent,
+		fp: map[string]string{
+			"impersonate": firefoxProfile,
+			"user-agent":  firefoxUserAgent,
+		},
+	}
+	headers := client.headers("/backend-api/conversation", nil)
+	if got := headers["User-Agent"]; got != firefoxUserAgent {
+		t.Fatalf("User-Agent = %q, want %q", got, firefoxUserAgent)
+	}
+	for key := range headers {
+		if key == "Priority" || strings.HasPrefix(key, "Sec-Ch-Ua") {
+			t.Fatalf("a Gecko request must not send %q: %#v", key, headers)
+		}
+	}
+	for key := range client.bootstrapHeaders() {
+		if strings.HasPrefix(key, "Sec-Ch-Ua") {
+			t.Fatalf("a Gecko bootstrap must not send %q", key)
+		}
+	}
+}
+
+func TestGeckoProfileReplacesPinnedIdentity(t *testing.T) {
+	// A Gecko profile with a leftover Chromium User-Agent would put a Chrome UA
+	// on a Firefox handshake, which is exactly the mismatch Cloudflare scores.
+	client := &Client{fp: map[string]string{
+		"impersonate": firefoxProfile,
+		"user-agent":  browserUserAgent,
+		"sec-ch-ua":   browserSecCHUA,
+	}}
+	client.applyBrowserFingerprint()
+	if got := client.fp["user-agent"]; got != firefoxUserAgent {
+		t.Fatalf("user-agent = %q, want %q", got, firefoxUserAgent)
+	}
+	if _, ok := client.fp["sec-ch-ua"]; ok {
+		t.Fatalf("sec-ch-ua must be dropped: %#v", client.fp)
+	}
+}
+
+func TestChromeFamilyIdentityKeepsChromiumClientHints(t *testing.T) {
+	client := &Client{
+		BaseURL:   "https://chatgpt.com",
+		userAgent: browserUserAgent,
+		fp: map[string]string{
+			"impersonate": "edge101",
+			"user-agent":  browserUserAgent,
+		},
+	}
+	client.applyBrowserFingerprint()
+	headers := client.headers("/backend-api/conversation", nil)
+	if headers["Priority"] == "" || headers["Sec-Ch-Ua"] == "" {
+		t.Fatalf("a Chromium identity must keep its client hints: %#v", headers)
+	}
+}

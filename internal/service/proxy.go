@@ -107,6 +107,14 @@ func browserHTTPClientForProfile(proxy, profile string, timeout time.Duration) *
 	return client.Std()
 }
 
+// GeckoProfile reports whether applyBrowserProfile() selects the Firefox/Gecko
+// TLS profile for the given impersonation value. Callers use it to keep the
+// Chromium-only Sec-CH-UA client hints off Gecko identities.
+func GeckoProfile(profile string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(profile))
+	return strings.Contains(normalized, "firefox") || strings.Contains(normalized, "ff")
+}
+
 func applyBrowserProfile(builder *surf.Builder, profile string) *surf.Builder {
 	impersonate := builder.Impersonate()
 	normalized := strings.ToLower(strings.TrimSpace(profile))
@@ -122,7 +130,7 @@ func applyBrowserProfile(builder *surf.Builder, profile string) *surf.Builder {
 	default:
 		impersonate = impersonate.Windows()
 	}
-	if strings.Contains(normalized, "firefox") || strings.Contains(normalized, "ff") {
+	if GeckoProfile(normalized) {
 		return impersonate.Firefox()
 	}
 	return impersonate.Chrome()

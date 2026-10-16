@@ -81,9 +81,13 @@ type AccountService struct {
 }
 
 const (
-	defaultRemoteUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+	// The remote account API (chatgpt.com) sits behind the same Cloudflare edge as
+	// the chat path, and surf pins its Chrome profile to the JA3 that edge answers
+	// with HTTP 403. Firefox/Gecko is accepted, and never sends the Sec-CH-UA
+	// family.
+	defaultRemoteUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
 	defaultRemoteSecCHUA   = `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`
-	defaultRemoteProfile   = "chrome145"
+	defaultRemoteProfile   = "firefox148"
 )
 
 func NewAccountService(backend storage.Backend, config AccountConfig, proxy *ProxyService, logs *LogService) *AccountService {
@@ -2633,6 +2637,14 @@ func (s *AccountService) remoteHeaders(accessToken string) map[string]string {
 		"sec-ch-ua-mobile":   firstNonEmpty(clean("sec-ch-ua-mobile"), "?0"),
 		"sec-ch-ua-platform": firstNonEmpty(clean("sec-ch-ua-platform"), `"Windows"`),
 	}
+	if GeckoProfile(s.remoteImpersonation(accessToken)) {
+		// Firefox/Gecko never sends the Chromium client hints.
+		for key := range headers {
+			if strings.HasPrefix(key, "sec-ch-ua") {
+				delete(headers, key)
+			}
+		}
+	}
 	if deviceID := clean("oai-device-id", "oai_device_id"); deviceID != "" {
 		headers["oai-device-id"] = deviceID
 	}
@@ -2657,7 +2669,7 @@ func (s *AccountService) remoteBootstrapHeaders(accessToken string) map[string]s
 		}
 		return ""
 	}
-	return map[string]string{
+	headers := map[string]string{
 		"user-agent":                firstNonEmpty(clean("user-agent", "user_agent"), defaultRemoteUserAgent),
 		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 		"accept-language":           "zh-CN,zh;q=0.9,en;q=0.8",
@@ -2670,6 +2682,15 @@ func (s *AccountService) remoteBootstrapHeaders(accessToken string) map[string]s
 		"sec-fetch-user":            "?1",
 		"upgrade-insecure-requests": "1",
 	}
+	if GeckoProfile(s.remoteImpersonation(accessToken)) {
+		// Firefox/Gecko never sends the Chromium client hints.
+		for key := range headers {
+			if strings.HasPrefix(key, "sec-ch-ua") {
+				delete(headers, key)
+			}
+		}
+	}
+	return headers
 }
 
 func (s *AccountService) remoteImpersonation(accessToken string) string {

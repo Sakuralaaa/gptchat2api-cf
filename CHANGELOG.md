@@ -1,5 +1,12 @@
 # Changelog
 
+
+## [Unreleased]
+
+### 修复
+
+- 后端浏览器身份切换到 Firefox/Gecko 档：Cloudflare 的放行判定跟随 TLS/JA3 握手而不是 User-Agent，而 `surf` 的 Chrome 档位固定为 `JA().Chrome145()`，其握手会被 chatgpt.com 直接 403。默认 `impersonate` 改为 `firefox148`，User-Agent 同步换成 Gecko，并在 Gecko 身份下不再发送 `Sec-CH-UA*` 与 `Priority`（Firefox 本身不发这些头），避免「Firefox 握手 + Chrome 客户端提示」的身份错配。账号记录里自带 Chromium 指纹（`fp`/`impersonate`）时仍按原档位处理。
+- 账号维护链路（`remoteHeaders`、`remoteBootstrapHeaders`、刷新客户端、配额与上游维护请求）与对话链路使用同一套 Firefox/Gecko 身份与请求头。
 ## [0.3.0] - 2026-05-26
 
 ### 新增

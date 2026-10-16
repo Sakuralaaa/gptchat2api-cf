@@ -32,7 +32,14 @@ const (
 	browserSecCHUAPlatformVersion = `"19.0.0"`
 	browserSecCHUAArch            = `"x86"`
 	browserSecCHUABitness         = `"64"`
-	browserImpersonationProfile   = "chrome145"
+
+	// Default identity: Firefox/Gecko. Cloudflare's edge verdict tracks the
+	// TLS/JA3 handshake rather than the User-Agent, and surf pins its Chrome
+	// profile to JA().Chrome145(), whose handshake chatgpt.com answers with HTTP
+	// 403; the Firefox148 handshake is accepted. Gecko never sends the Sec-CH-UA
+	// family, so those hints are dropped for a Gecko identity.
+	firefoxUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+	firefoxProfile   = "firefox148"
 )
 
 type AccountLookup interface {
@@ -236,12 +243,9 @@ func (c *Client) buildFingerprint() map[string]string {
 		}
 	}
 	defaults := map[string]string{
-		"user-agent":         browserUserAgent,
-		"impersonate":        browserImpersonationProfile,
-		"oai-device-id":      util.NewUUID(),
-		"oai-session-id":     util.NewUUID(),
-		"sec-ch-ua-mobile":   browserSecCHUAMobile,
-		"sec-ch-ua-platform": browserSecCHUAPlatform,
+		"impersonate":    firefoxProfile,
+		"oai-device-id":  util.NewUUID(),
+		"oai-session-id": util.NewUUID(),
 	}
 	for key, value := range defaults {
 		if fp[key] == "" {
@@ -249,6 +253,13 @@ func (c *Client) buildFingerprint() map[string]string {
 		}
 	}
 	return fp
+}
+
+// geckoIdentity reports whether the active impersonation profile selects the
+// Firefox/Gecko TLS profile (service.GeckoProfile), which never sends the
+// Chromium Sec-CH-UA client hints.
+func (c *Client) geckoIdentity() bool {
+	return service.GeckoProfile(c.fp["impersonate"])
 }
 
 func (c *Client) applyBrowserFingerprint() {
@@ -260,7 +271,19 @@ func (c *Client) applyBrowserFingerprint() {
 			c.fp[key] = value
 		}
 	}
-	setDefault("impersonate", browserImpersonationProfile)
+	setDefault("impersonate", firefoxProfile)
+	if c.geckoIdentity() {
+		// A Chromium User-Agent on a Gecko TLS handshake is exactly the mismatch
+		// Cloudflare scores: pin the User-Agent to the active profile and drop the
+		// Chromium-only client hints.
+		c.fp["user-agent"] = firefoxUserAgent
+		for key := range c.fp {
+			if strings.HasPrefix(key, "sec-ch-ua") {
+				delete(c.fp, key)
+			}
+		}
+		return
+	}
 	setDefault("user-agent", browserUserAgent)
 	setDefault("sec-ch-ua-mobile", browserSecCHUAMobile)
 	setDefault("sec-ch-ua-platform", browserSecCHUAPlatform)
@@ -374,6 +397,16 @@ func (c *Client) headers(path string, extra map[string]string) map[string]string
 		"OAI-Client-Build-Number":     c.ClientBuildNumber,
 		"X-OpenAI-Target-Route":       path,
 	}
+	if c.geckoIdentity() {
+		// Firefox/Gecko never sends the Chromium client hints. Sending them on a
+		// Gecko handshake is exactly the browser-identity mismatch Cloudflare
+		// scores.
+		for key := range headers {
+			if key == "Priority" || strings.HasPrefix(key, "Sec-Ch-Ua") {
+				delete(headers, key)
+			}
+		}
+	}
 	if c.AccessToken != "" {
 		headers["Authorization"] = "Bearer " + c.AccessToken
 	}
@@ -384,7 +417,7 @@ func (c *Client) headers(path string, extra map[string]string) map[string]string
 }
 
 func (c *Client) bootstrapHeaders() map[string]string {
-	return map[string]string{
+	headers := map[string]string{
 		"User-Agent":                c.userAgent,
 		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 		"Accept-Language":           "zh-CN,zh;q=0.9,en;q=0.8",
@@ -397,6 +430,15 @@ func (c *Client) bootstrapHeaders() map[string]string {
 		"Sec-Fetch-User":            "?1",
 		"Upgrade-Insecure-Requests": "1",
 	}
+	if c.geckoIdentity() {
+		// Firefox/Gecko never sends the Chromium client hints.
+		for key := range headers {
+			if strings.HasPrefix(key, "Sec-Ch-Ua") {
+				delete(headers, key)
+			}
+		}
+	}
+	return headers
 }
 
 // cloudflareSolver is an optional capability of the account lookup: when present
